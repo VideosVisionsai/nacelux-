@@ -67,10 +67,28 @@ class API(BaseHTTPRequestHandler):
     def do_GET(self):
         p=urlparse(self.path); path=p.path; q=flatten(p.query)
         try:
-            if path in ("/health", "/api/v1/health"):
+            if path in ("/health", "/health/liveness"):
+                return self.json({"status": "ALIVE", "version": "2.1", "timestamp": data.now()})
+            if path in ("/api/v1/health", "/health/readiness"):
+                # Active database connectivity check
+                db_healthy = True
+                db_err = None
+                try:
+                    with data.connect() as db:
+                        db.execute("SELECT 1").fetchone()
+                except Exception as exc:
+                    db_healthy = False
+                    db_err = str(exc)
+
                 db_status = {"status": "CONNECTED", "provider": "supabase-postgresql"} if data.IS_POSTGRES else {"status": "LOCAL_FALLBACK", "provider": "sqlite"}
+                if not db_healthy:
+                    db_status["status"] = "UNAVAILABLE"
+                    db_status["error"] = db_err
+
+                overall_status = "HEALTHY" if db_healthy else "UNHEALTHY"
+                http_code = 200 if db_healthy else 503
                 return self.json({
-                    "status": "HEALTHY",
+                    "status": overall_status,
                     "version": "2.1",
                     "database": db_status,
                     "storage": PDF_STORAGE.status(),
@@ -78,7 +96,7 @@ class API(BaseHTTPRequestHandler):
                     "resa_connector": RESA_CONNECTOR.status(),
                     "auth_enabled": AUTH_ACTIVE,
                     "timestamp": data.now()
-                })
+                }, status=http_code)
             if path=="/api/v1/auth/config": return self.json({"enabled":AUTH_ACTIVE,"provider":"supabase","password_reset":True})
             if path=="/api/v1/session":
                 ctx=self.auth_context

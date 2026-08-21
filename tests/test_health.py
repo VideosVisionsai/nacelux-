@@ -25,7 +25,7 @@ class HealthApiTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def test_health_endpoint(self):
+    def test_health_readiness_endpoint(self):
         req = Request(f"http://127.0.0.1:{self.port}/api/v1/health")
         with urlopen(req, timeout=5) as res:
             self.assertEqual(res.status, 200)
@@ -37,9 +37,22 @@ class HealthApiTests(unittest.TestCase):
             self.assertIn('ocr', data)
             self.assertIn('resa_connector', data)
 
-    def test_root_health_endpoint(self):
+    def test_root_liveness_endpoint(self):
         req = Request(f"http://127.0.0.1:{self.port}/health")
         with urlopen(req, timeout=5) as res:
+            self.assertEqual(res.status, 200)
+            data = json.loads(res.read().decode())
+            self.assertEqual(data.get('status'), 'ALIVE')
+
+    def test_explicit_liveness_and_readiness_subpaths(self):
+        req_live = Request(f"http://127.0.0.1:{self.port}/health/liveness")
+        with urlopen(req_live, timeout=5) as res:
+            self.assertEqual(res.status, 200)
+            data = json.loads(res.read().decode())
+            self.assertEqual(data.get('status'), 'ALIVE')
+
+        req_ready = Request(f"http://127.0.0.1:{self.port}/health/readiness")
+        with urlopen(req_ready, timeout=5) as res:
             self.assertEqual(res.status, 200)
             data = json.loads(res.read().decode())
             self.assertEqual(data.get('status'), 'HEALTHY')

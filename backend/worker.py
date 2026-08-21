@@ -62,18 +62,36 @@ class Worker:
         self.resa_connector = LBRResaConnector(self.connect)
 
     def process_queued_jobs(self, limit=10) -> int:
-        """Fetch and execute jobs marked as QUEUED in the database."""
+        """Fetch and atomically claim jobs marked as QUEUED in the database."""
         processed = 0
+        now_iso = utcnow()
+        claimed_jobs = []
+
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT id, organization_id, job_type, payload FROM jobs WHERE status = 'QUEUED' ORDER BY started_at ASC LIMIT ?",
+            # First, recover any stuck jobs that crashed while RUNNING
+            self._reap_stuck_jobs(db)
+
+            # Query candidate QUEUED jobs
+            candidates = db.execute(
+                "SELECT id, organization_id, job_type, payload, attempt FROM jobs WHERE status = 'QUEUED' ORDER BY started_at ASC LIMIT ?",
                 (limit,)
             ).fetchall()
 
-        for row in rows:
+            for row in candidates:
+                job_id = row['id']
+                # Atomically transition from QUEUED to RUNNING to avoid race conditions between workers
+                res = db.execute(
+                    "UPDATE jobs SET status = 'RUNNING', started_at = ?, attempt = COALESCE(attempt, 0) + 1 WHERE id = ? AND status = 'QUEUED'",
+                    (now_iso, job_id)
+                )
+                # Check if this worker instance successfully claimed the job
+                claimed_count = getattr(res, 'rowcount', 1)
+                if claimed_count > 0:
+                    claimed_jobs.append(dict(row))
+
+        for job in claimed_jobs:
             if not RUNNING:
                 break
-            job = dict(row)
             payload = {}
             if job.get('payload'):
                 try:
@@ -84,6 +102,17 @@ class Worker:
             processed += 1
 
         return processed
+
+    def _reap_stuck_jobs(self, db, timeout_minutes=15):
+        """Recover jobs that remained in RUNNING state past the timeout threshold (e.g. following worker process crash)."""
+        try:
+            # For SQLite/PostgreSQL compatibility, mark stuck running jobs as RETRY or FAILED if max attempts exceeded
+            db.execute(
+                "UPDATE jobs SET status = CASE WHEN COALESCE(attempt, 1) >= 3 THEN 'FAILED' ELSE 'QUEUED' END, error = 'Recovered from unexpected worker termination' WHERE status = 'RUNNING' AND started_at < datetime('now', '-' || ? || ' minutes')",
+                (timeout_minutes,)
+            )
+        except Exception:
+            pass
 
     def execute_job(self, job_id: str, org_id: str, job_type: str, payload: dict) -> dict:
         """Execute a single job and update its lifecycle status in the database."""
