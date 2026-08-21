@@ -29,5 +29,14 @@ class MigrationIntegrityTests(unittest.TestCase):
             digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
             self.assertEqual(len(digest), 64)
 
+    def test_start_sh_refuses_sqlite_fallback_and_failed_migrations(self):
+        start = (ROOT / 'start.sh').read_text(encoding='utf-8')
+        self.assertIn('Silent SQLite fallback is forbidden', start)
+        self.assertIn('Database migration failed. Refusing to start', start)
+        self.assertNotIn('Continuing with startup', start)
+        railway = (ROOT / 'railway.json').read_text(encoding='utf-8')
+        self.assertIn('"/health"', railway)
+        self.assertNotIn('/api/v1/health', railway)
+
 if __name__ == '__main__':
     unittest.main()

@@ -7,7 +7,17 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 PROVIDER=os.getenv('DB_PROVIDER','auto').lower()
-IS_POSTGRES=bool(DATABASE_URL) and PROVIDER in ('auto','postgresql','postgres','supabase')
+_EXPLICIT_PG=PROVIDER in ('postgresql','postgres','supabase')
+_PRODUCTION=os.getenv('NACELUX_ENV','development').lower() in ('production','prod')
+if _EXPLICIT_PG or _PRODUCTION:
+    if not DATABASE_URL:
+        raise RuntimeError(
+            'DATABASE_URL is required when DB_PROVIDER=postgresql or NACELUX_ENV=production. '
+            'Silent SQLite fallback is forbidden.'
+        )
+    IS_POSTGRES=True
+else:
+    IS_POSTGRES=bool(DATABASE_URL) and PROVIDER in ('auto','postgresql','postgres','supabase')
 BACKEND='postgresql' if IS_POSTGRES else 'sqlite'
 
 class SqliteConnection:

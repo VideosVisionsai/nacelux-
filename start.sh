@@ -1,27 +1,44 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "=== NACELUX Rev. 2.1 — Production Startup ==="
 echo "Date: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
 echo "Environment: ${NACELUX_ENV:-production}"
 echo "Process Type: ${PROCESS_TYPE:-web}"
 
-# 1. Automatic PostgreSQL / Supabase Migrations
-if [ -n "$DATABASE_URL" ]; then
-    echo "PostgreSQL DATABASE_URL detected."
-    if [ "${AUTO_MIGRATE:-true}" = "true" ] || [ "${AUTO_MIGRATE:-true}" = "1" ]; then
-        echo "Running idempotent database migrations..."
-        python3 scripts/supabase_db.py migrate || {
-            echo "WARNING: Automatic migration returned non-zero. Continuing with startup..."
-        }
+# Production never falls back to SQLite. DATABASE_URL is mandatory.
+if [ -z "${DATABASE_URL:-}" ]; then
+    echo "ERROR: DATABASE_URL is not set. Silent SQLite fallback is forbidden in production."
+    echo "Set DATABASE_URL to a PostgreSQL/Supabase connection string and DB_PROVIDER=postgresql."
+    exit 1
+fi
+
+if [ "${DB_PROVIDER:-postgresql}" != "postgresql" ] && [ "${DB_PROVIDER:-}" != "postgres" ] && [ "${DB_PROVIDER:-}" != "supabase" ]; then
+    echo "ERROR: DB_PROVIDER=${DB_PROVIDER} is not PostgreSQL. SQLite fallback is forbidden."
+    exit 1
+fi
+
+echo "PostgreSQL DATABASE_URL detected (provider=${DB_PROVIDER:-postgresql})."
+
+if [ "${AUTO_MIGRATE:-true}" = "true" ] || [ "${AUTO_MIGRATE:-true}" = "1" ]; then
+    echo "Running idempotent database migrations..."
+    if ! python3 scripts/supabase_db.py migrate; then
+        echo "ERROR: Database migration failed. Refusing to start. No SQLite fallback."
+        exit 1
     fi
-    if [ "${MIGRATE_SQLITE_DATA:-false}" = "true" ] || [ "${MIGRATE_SQLITE_DATA:-false}" = "1" ]; then
-        echo "Copying baseline SQLite data..."
-        python3 scripts/supabase_db.py copy-sqlite || true
+    echo "Migrations completed successfully."
+else
+    echo "AUTO_MIGRATE is disabled; skipping schema migrations."
+fi
+
+if [ "${MIGRATE_SQLITE_DATA:-false}" = "true" ] || [ "${MIGRATE_SQLITE_DATA:-false}" = "1" ]; then
+    echo "Copying baseline SQLite data into PostgreSQL..."
+    if ! python3 scripts/supabase_db.py copy-sqlite; then
+        echo "ERROR: SQLite copy into PostgreSQL failed. Refusing to start."
+        exit 1
     fi
 fi
 
-# 2. Dispatch based on PROCESS_TYPE
 case "${PROCESS_TYPE:-web}" in
     worker)
         echo "Starting NACELUX background worker..."
