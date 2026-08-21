@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS opportunity_scores(id TEXT PRIMARY KEY,organization_i
 CREATE INDEX IF NOT EXISTS idx_opp_score ON opportunity_scores(organization_id,score DESC);
 CREATE TABLE IF NOT EXISTS prospects(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,status TEXT,priority TEXT,owner TEXT,assigned_to TEXT,notes TEXT,next_action TEXT,next_action_date TEXT,last_contacted_at TEXT,created_at TEXT,updated_at TEXT,UNIQUE(organization_id,company_id));
 CREATE TABLE IF NOT EXISTS data_sources(id TEXT PRIMARY KEY,organization_id TEXT,name TEXT,source_type TEXT,base_url TEXT,status TEXT,last_run_at TEXT,records_count INTEGER DEFAULT 0,note TEXT);
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,organization_id TEXT,job_type TEXT,status TEXT,started_at TEXT,finished_at TEXT,records_processed INTEGER DEFAULT 0,error TEXT);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,organization_id TEXT,job_type TEXT,status TEXT,started_at TEXT,finished_at TEXT,records_processed INTEGER DEFAULT 0,error TEXT,payload TEXT DEFAULT '{}',attempt INTEGER DEFAULT 0,schedule TEXT);
 CREATE TABLE IF NOT EXISTS data_lineage(id TEXT PRIMARY KEY,organization_id TEXT,entity_type TEXT,entity_id TEXT,field_name TEXT,source_id TEXT,source_url TEXT,document_id TEXT,retrieved_at TEXT,confidence REAL,method TEXT);
 CREATE TABLE IF NOT EXISTS audit_logs(id TEXT PRIMARY KEY,organization_id TEXT,user_id TEXT,action TEXT,entity_type TEXT,entity_id TEXT,metadata TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS nace_codes(id TEXT PRIMARY KEY,version TEXT NOT NULL,code TEXT NOT NULL,level TEXT NOT NULL,title_fr TEXT,title_de TEXT,title_en TEXT,parent_code TEXT,includes_text TEXT,excludes_text TEXT,source_status TEXT,source_url TEXT,is_demo INTEGER DEFAULT 1,UNIQUE(version,code));
@@ -104,6 +104,9 @@ def init_db():
         for name,kind in {'status':"TEXT DEFAULT 'ACTIVE'",'first_detected_at':'TEXT','last_seen_at':'TEXT','evidence':"TEXT DEFAULT '{}'",'severity':'TEXT','rule_version':'TEXT','explanation':'TEXT','expires_at':'TEXT','data_quality':"TEXT DEFAULT 'UNKNOWN'"}.items():
             if name not in signal_existing:db.execute(f'ALTER TABLE business_signals ADD COLUMN {name} {kind}')
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_business_signal_unique ON business_signals(organization_id,company_id,signal_type)")
+        jobs_existing={r['name'] for r in db.execute("PRAGMA table_info(jobs)")}
+        for name,kind in {'payload':"TEXT DEFAULT '{}'",'attempt':'INTEGER DEFAULT 0','schedule':'TEXT'}.items():
+            if name not in jobs_existing:db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         people_existing={r['name'] for r in db.execute("PRAGMA table_info(people)")}
         for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT'}.items():
             if name not in people_existing:db.execute(f'ALTER TABLE people ADD COLUMN {name} {kind}')

@@ -1,1 +1,2 @@
-web: python3 backend/app.py
+web: ./start.sh
+worker: PROCESS_TYPE=worker ./start.sh

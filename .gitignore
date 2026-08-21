@@ -1,9 +1,14 @@
 .env
 .env.*
 !.env.example
+*.db
 *.db-journal
 *.db-wal
 *.db-shm
+data/*.db
+data/document-storage/*
+data/resa-artifacts/*
+data/nace-imports/*
 __pycache__/
 *.py[cod]
 .venv/

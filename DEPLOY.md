@@ -1,120 +1,120 @@
-# Déploiement NACELUX – SaaS fonctionnel
+# Déploiement NACELUX Rev. 2.1 — Production Ready
 
-## Pourquoi le projet semblait "corrompu"
+Ce guide fournit toutes les instructions pour déployer NACELUX en production sur **Railway**, **Docker**, **Render** ou **Fly.io** avec **Supabase** (PostgreSQL, Auth, Storage, RLS) et les **workers OCR / SEO / RESA**.
 
-Le ZIP original était un dump complet d'un **workspace agent** (fichiers `.railway/`, binaires, skills, certificats, sessions…).  
-Ce n'est **pas** le code de l'application. Le vrai code applicatif est propre et se trouve dans le dossier `nacelux/`.
+---
 
-## Architecture cible (déjà prête)
+## 1. Architecture Déployée
 
-- **Backend** : Python 3 stdlib + `psycopg` + `PyJWT` (serveur HTTP natif)
-- **Frontend** : SPA HTML/CSS/JS
-- **Base de données** : Supabase PostgreSQL (déjà configuré dans ton `.env`)
-- **Auth** : Supabase Auth (cookies HttpOnly + CSRF)
-- **Stockage documents** : local ou Supabase Storage
-
-## Option 1 – Railway (recommandé, déjà préparé)
-
-1. Crée un **nouveau** projet Railway (ne réutilise pas l'ancien workspace corrompu).
-2. Connecte ton repo GitHub (ou déploie depuis ce dossier propre).
-3. Ajoute les variables d'environnement depuis `.env.example` (ne committe **jamais** le vrai `.env`).
-4. Railway détecte `railway.json` et lance `python3 backend/app.py`.
-5. Point le domaine custom si besoin.
-
-```bash
-# En local pour tester
-cp .env.example .env
-# édite .env avec tes vraies valeurs Supabase
-pip install -r requirements.txt
-python3 backend/app.py
+```text
+┌────────────────────────────────────────────────────────┐
+│               Railway / Container Cloud                │
+│                                                        │
+│  ┌──────────────────────┐    ┌──────────────────────┐  │
+│  │   Web Service (API)  │    │  Background Worker   │  │
+│  │   python3 app.py     │    │  python3 worker.py   │  │
+│  └──────────┬───────────┘    └──────────┬───────────┘  │
+└─────────────┼───────────────────────────┼──────────────┘
+              │                           │
+              ▼                           ▼
+┌────────────────────────────────────────────────────────┐
+│                   Supabase Cloud                       │
+│  ├── PostgreSQL Database (Migrations 0001-0011 + RLS) │
+│  ├── GoTrue Auth (Cookies HttpOnly + CSRF)             │
+│  └── Storage Bucket (resa-documents PDF deduplicated)  │
+└────────────────────────────────────────────────────────┘
 ```
 
-## Option 2 – Render.com (très simple)
+---
 
-1. New → Web Service
-2. Build Command : `pip install -r requirements.txt`
-3. Start Command : `python3 backend/app.py`
-4. Ajoute toutes les variables d'environnement
-5. Health check path : `/api/v1/health` (si disponible) ou `/`
+## 2. Déploiement en 1 Clic sur Railway
 
-## Option 3 – Fly.io
+### Étape 1 : Créer le projet Railway
+1. Va sur [Railway.app](https://railway.app) → **New Project**.
+2. Sélectionne **Deploy from GitHub repo** et choisis ce repository.
+3. Railway utilise automatiquement le `Dockerfile` et `railway.json`.
 
-```bash
-fly launch
-# choisis Python
-fly secrets set DATABASE_URL=... SUPABASE_URL=... etc.
-fly deploy
+### Étape 2 : Configurer les Variables d'Environnement
+Dans Railway, va dans l'onglet **Variables** du service et ajoute :
+
+```env
+DATABASE_URL=postgresql://postgres.VOTRE_REF:MOT_DE_PASSE@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+DB_PROVIDER=postgresql
+SUPABASE_URL=https://VOTRE_REF.supabase.co
+SUPABASE_ANON_KEY=eyJhbGciOi...
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOi...
+AUTH_REDIRECT_URL=https://votre-app.up.railway.app
+AUTH_COOKIE_SECURE=true
+AUTO_MIGRATE=true
+LBR_RESA_ENABLED=true
+PDF_OCR_ENABLED=true
+PORT=8000
 ```
 
-## Option 4 – VPS classique (DigitalOcean, Hetzner, OVH…)
+### Étape 3 : Lancer le Worker de fond (Optionnel mais recommandé)
+Dans le même projet Railway :
+1. Clique sur **+ New Service** → **GitHub Repo** (même repo).
+2. Nomme ce service `nacelux-worker`.
+3. Dans **Variables**, ajoute les mêmes variables que le service Web, avec en plus :
+   ```env
+   PROCESS_TYPE=worker
+   ```
+4. Le worker s'exécute en continu pour traiter l'OCR Tesseract, les audits SEO et les signaux en arrière-plan.
+
+---
+
+## 3. Configuration Supabase
+
+1. **Database** :
+   - Récupère l'URI de connexion dans **Project Settings → Database → Connection string (Session pooler)**.
+   - Assure-toi que `AUTO_MIGRATE=true` est activé : au premier démarrage, le script `start.sh` applique automatiquement les migrations `0001` à `0011` sans intervention manuelle.
+2. **Authentication** :
+   - Dans **Authentication → URL Configuration**, ajoute l'URL de ton application Railway dans **Site URL** et **Redirect URLs**.
+3. **Storage** :
+   - Crée un bucket nommé `resa-documents` (privé).
+   - Renseigne `SUPABASE_SERVICE_ROLE_KEY` pour autoriser le backend à y écrire.
+
+---
+
+## 4. Déploiement Local avec Docker Compose
+
+Pour tester l'ensemble de l'infrastructure en local (Web + Worker + PostgreSQL) :
 
 ```bash
-# Sur le serveur
-git clone <ton-repo>
-cd nacelux
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# copier .env
-# systemd service
+# Lance PostgreSQL, le Web API et le Worker en conteneurs isolés
+docker compose up --build
 ```
 
-Exemple unit systemd :
+- Web API : `http://localhost:8000`
+- Healthcheck : `http://localhost:8000/api/v1/health`
+- Base PostgreSQL locale : `localhost:5432`
 
-```ini
-[Unit]
-Description=NACELUX SaaS
-After=network.target
+---
 
-[Service]
-User=www-data
-WorkingDirectory=/opt/nacelux
-EnvironmentFile=/opt/nacelux/.env
-ExecStart=/opt/nacelux/.venv/bin/python3 backend/app.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Puis Nginx en reverse proxy sur le port 8000.
-
-## Option 5 – Docker (universel)
+## 5. Commandes CLI utiles
 
 ```bash
-docker build -t nacelux .
-docker run -p 8000:8000 --env-file .env nacelux
-```
-
-## Checklist pour un SaaS 100 % fonctionnel
-
-- [ ] Nouveau projet Railway / Render / Fly (propre)
-- [ ] Variables d'environnement correctement renseignées (surtout `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`)
-- [ ] Migrations appliquées : `python3 scripts/supabase_db.py setup`
-- [ ] Dans Supabase Dashboard → Authentication → URL Configuration : ajouter ton domaine de production
-- [ ] `AUTH_REDIRECT_URL` pointe vers ton domaine
-- [ ] Test : `GET /api/v1/health/database` → doit retourner CONNECTED
-- [ ] Signup / Login fonctionne
-- [ ] Création automatique d'organisation au premier login
-
-## Sécurité critique
-
-Le fichier `.env` original contient des **secrets en clair**.  
-**Rotation obligatoire** :
-1. Change le mot de passe de la base Supabase
-2. Régénère les clés `anon` et `service_role` si elles ont fuité
-3. Ne jamais recommitter un `.env`
-
-## Support local rapide
-
-```bash
-cd nacelux
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# édite .env
+# Vérifier la connexion Supabase et les migrations
 python3 scripts/supabase_db.py test
-python3 backend/app.py
+python3 scripts/supabase_db.py migrate
+
+# Exécuter un cycle de worker en direct
+python3 backend/worker.py --once
+
+# Lancer le connecteur RESA manuellement
+python3 scripts/resa_sync.py https://www.lbr.lu/mjrcs-web-front/publication-journal/RESA-2026_231_1_0
+
+# Importer la nomenclature NACE Rev. 2.1 officielle
+python3 scripts/import_nace21.py
 ```
 
-Ouvre http://localhost:8000
+---
+
+## 6. Endpoints de Contrôle & Santé
+
+| Endpoint | Méthode | Rôle |
+|---|---|---|
+| `/health` ou `/api/v1/health` | GET | Statut global, base de données, stockage, OCR, connecteurs |
+| `/api/v1/health/database` | GET | Statut détaillé de la connexion PostgreSQL Supabase |
+| `/api/v1/session` | GET | Session active, utilisateur et tenant courant |
+| `/api/v1/jobs` | POST | Déclenchement d'un job asynchrone (OCR, SEO, RESA, NACE...) |

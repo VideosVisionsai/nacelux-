@@ -67,6 +67,18 @@ class API(BaseHTTPRequestHandler):
     def do_GET(self):
         p=urlparse(self.path); path=p.path; q=flatten(p.query)
         try:
+            if path in ("/health", "/api/v1/health"):
+                db_status = {"status": "CONNECTED", "provider": "supabase-postgresql"} if data.IS_POSTGRES else {"status": "LOCAL_FALLBACK", "provider": "sqlite"}
+                return self.json({
+                    "status": "HEALTHY",
+                    "version": "2.1",
+                    "database": db_status,
+                    "storage": PDF_STORAGE.status(),
+                    "ocr": PDF_EXTRACTION.status(),
+                    "resa_connector": RESA_CONNECTOR.status(),
+                    "auth_enabled": AUTH_ACTIVE,
+                    "timestamp": data.now()
+                })
             if path=="/api/v1/auth/config": return self.json({"enabled":AUTH_ACTIVE,"provider":"supabase","password_reset":True})
             if path=="/api/v1/session":
                 ctx=self.auth_context
