@@ -382,4 +382,10 @@ class API(BaseHTTPRequestHandler):
         raw=file.read_bytes(); self.send_response(200); self.send_header("Content-Type",mimetypes.guess_type(str(file))[0] or "application/octet-stream");self.send_header("Content-Length",str(len(raw)));self.end_headers();self.wfile.write(raw)
 
 if __name__=="__main__":
-    data.init_db(); print(f"NACELUX running on http://0.0.0.0:{PORT}"); ThreadingHTTPServer(("0.0.0.0",PORT),API).serve_forever()
+    defer_db_init=os.environ.get('NACELUX_SKIP_DB_INIT','false').lower() in ('1','true','yes')
+    if defer_db_init:
+        print('[db] Initialization deferred to startup supervisor; liveness is available.')
+    else:
+        data.init_db()
+    print(f"NACELUX running on http://0.0.0.0:{PORT}")
+    ThreadingHTTPServer(("0.0.0.0",PORT),API).serve_forever()

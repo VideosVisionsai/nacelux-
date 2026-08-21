@@ -3,6 +3,9 @@ set -euo pipefail
 
 ENVIRONMENT="${NACELUX_ENV:-production}"
 PROCESS="${PROCESS_TYPE:-web}"
+WEB_PID=""
+WORKER_PID=""
+
 echo "=== NACELUX Rev. 2.1 — Startup ==="
 echo "Date: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
 echo "Environment: ${ENVIRONMENT}"
@@ -62,19 +65,19 @@ if [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
         echo "ERROR: LBR_RESA_ENABLED and PDF_OCR_ENABLED must be explicitly configured."
         exit 1
     fi
-    # This validates provider, URL scheme and sslmode without printing any value.
+    # Validate configuration without printing any credential or connection URI.
     python3 - <<'PY'
+import os
 import sys
 sys.path.insert(0, 'backend')
 from db_adapter import validate_production_database_config, validate_database_url
 import auth
 auth.validate_production_auth()
 validate_production_database_config()
-validate_database_url(__import__('os').environ.get('MIGRATION_DATABASE_URL',''), require_ssl=True)
+validate_database_url(os.environ.get('MIGRATION_DATABASE_URL', ''), require_ssl=True)
 print('Production configuration validated: PostgreSQL, TLS, Supabase Auth and private storage.')
 PY
 else
-    # Development/test may use the explicit SQLite adapter and seeded fixtures.
     if [ "${DB_PROVIDER:-auto}" = "sqlite" ]; then
         echo "Development SQLite mode enabled explicitly."
     fi
@@ -84,39 +87,84 @@ if [ -n "${DATABASE_URL:-}" ]; then
     echo "PostgreSQL configuration accepted without exposing credentials."
 fi
 
-if [ "${AUTO_MIGRATE:-true}" = "true" ] || [ "${AUTO_MIGRATE:-true}" = "1" ]; then
-    if [ -n "${DATABASE_URL:-}" ]; then
-        echo "Running idempotent database migrations..."
-        if ! python3 scripts/supabase_db.py migrate; then
-            echo "ERROR: Database migration failed. Refusing to start."
-            exit 1
+run_migrations() {
+    if [ "${AUTO_MIGRATE:-true}" = "true" ] || [ "${AUTO_MIGRATE:-true}" = "1" ]; then
+        if [ -n "${DATABASE_URL:-}" ]; then
+            echo "Running idempotent database migrations..."
+            if ! python3 scripts/supabase_db.py migrate; then
+                echo "ERROR: Database migration failed. Refusing to start. No SQLite fallback."
+                return 1
+            fi
+            echo "Migrations completed successfully."
+        elif [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
+            echo "ERROR: DATABASE_URL is mandatory before migrations in production."
+            return 1
+        else
+            echo "Development SQLite schema will be initialized by the application."
         fi
-        echo "Migrations completed successfully."
-    elif [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
-        echo "ERROR: DATABASE_URL is mandatory before migrations in production."
-        exit 1
     else
-        echo "Development SQLite schema will be initialized by the application."
+        echo "AUTO_MIGRATE is disabled; skipping schema migrations."
     fi
-else
-    echo "AUTO_MIGRATE is disabled; skipping schema migrations."
-fi
+}
+
+stop_children() {
+    if [ -n "${WORKER_PID}" ] && kill -0 "${WORKER_PID}" 2>/dev/null; then
+        kill "${WORKER_PID}" 2>/dev/null || true
+    fi
+    if [ -n "${WEB_PID}" ] && kill -0 "${WEB_PID}" 2>/dev/null; then
+        kill "${WEB_PID}" 2>/dev/null || true
+    fi
+}
+
+start_web_for_production() {
+    echo "Starting HTTP Web API on port ${PORT:-8000} before database readiness checks..."
+    # /health is a liveness endpoint. Database initialization is performed by
+    # this parent process while the web process can answer liveness immediately.
+    NACELUX_SKIP_DB_INIT=true python3 backend/app.py &
+    WEB_PID=$!
+    trap 'stop_children' EXIT INT TERM
+}
 
 case "${PROCESS}" in
     worker)
+        run_migrations
         echo "Starting NACELUX background worker..."
         exec python3 backend/worker.py
         ;;
     all|both|full)
-        echo "Starting background worker in sub-process..."
-        python3 backend/worker.py &
-        WORKER_PID=$!
-        trap "kill $WORKER_PID 2>/dev/null || true" EXIT
-        echo "Starting HTTP Web API on port ${PORT:-8000}..."
-        exec python3 backend/app.py
+        if [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
+            start_web_for_production
+            if ! run_migrations; then
+                stop_children
+                wait "${WEB_PID}" 2>/dev/null || true
+                exit 1
+            fi
+            echo "Starting background worker after migrations completed..."
+            python3 backend/worker.py &
+            WORKER_PID=$!
+            wait "${WEB_PID}"
+        else
+            run_migrations
+            echo "Starting background worker..."
+            python3 backend/worker.py &
+            WORKER_PID=$!
+            echo "Starting HTTP Web API on port ${PORT:-8000}..."
+            exec python3 backend/app.py
+        fi
         ;;
     web|*)
-        echo "Starting HTTP Web API on port ${PORT:-8000}..."
-        exec python3 backend/app.py
+        if [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
+            start_web_for_production
+            if ! run_migrations; then
+                stop_children
+                wait "${WEB_PID}" 2>/dev/null || true
+                exit 1
+            fi
+            wait "${WEB_PID}"
+        else
+            run_migrations
+            echo "Starting HTTP Web API on port ${PORT:-8000}..."
+            exec python3 backend/app.py
+        fi
         ;;
 esac
