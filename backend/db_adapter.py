@@ -15,6 +15,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PROVIDER = os.getenv("DB_PROVIDER", "auto").lower().strip()
 _PRODUCTION = os.getenv("NACELUX_ENV", "development").lower() in ("production", "prod")
 _EXPLICIT_PG = PROVIDER in ("postgresql", "postgres", "supabase")
+_RUNTIME_TENANT_TABLES = ('organizations','users','organization_members','companies','business_signals','opportunity_scores','prospects','data_sources','jobs','data_lineage','audit_logs','taxonomy_nodes','people','digital_checks','seo_audits','reports','territories','scoring_weights','resa_journals','resa_entries','resa_documents','resa_sync_runs','storage_objects','document_extractions','document_page_extractions')
 
 _tenant_organization: ContextVar[str | None] = ContextVar("nacelux_tenant_organization", default=None)
 _tenant_user: ContextVar[str | None] = ContextVar("nacelux_tenant_user", default=None)
@@ -162,6 +163,17 @@ def connect():
                 connection._conn.rollback()
                 connection._conn.close()
                 raise ProductionConfigurationError('Connected PostgreSQL role does not match DB_RUNTIME_ROLE')
+            owned=connection.execute("""SELECT count(*) AS count
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+                  AND n.nspname='public'
+                  AND c.relkind IN ('r','p')
+                  AND c.relname = ANY(%s)""", (list(_RUNTIME_TENANT_TABLES),)).fetchone()
+            if owned and owned['count']:
+                connection._conn.rollback()
+                connection._conn.close()
+                raise ProductionConfigurationError('Runtime PostgreSQL role must not own tenant tables')
         return connection
     if _PRODUCTION:
         # Defensive belt-and-suspenders guard: this branch must be unreachable.
