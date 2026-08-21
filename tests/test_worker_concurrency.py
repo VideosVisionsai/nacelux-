@@ -57,7 +57,7 @@ class WorkerConcurrencyTests(unittest.TestCase):
         # Insert a job stuck in RUNNING state from 30 minutes ago
         with self.connect() as db:
             db.execute(
-                "INSERT INTO jobs(id, organization_id, job_type, status, started_at, payload, attempt) VALUES(?,?,?,?,datetime('now', '-30 minutes'),?,?)",
+                "INSERT INTO jobs(id, organization_id, job_type, status, started_at, payload, attempt, schedule) VALUES(?,?,?,?,datetime('now', '-30 minutes'),?,?, 'RETRY')",
                 (job_id, 'org_conc_test', 'OPPORTUNITY_RECALCULATION', 'RUNNING', '{}', 1)
             )
 

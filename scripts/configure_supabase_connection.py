@@ -28,12 +28,12 @@ def main():
     if password!=confirm:raise SystemExit('Passwords do not match.')
     user=f'postgres.{project}';host=f'aws-0-{region}.pooler.supabase.com'
     url=f'postgresql://{user}:{quote(password,safe="")}@{host}:5432/postgres?sslmode=require'
-    values=read_env();values.update({'DATABASE_URL':url,'DB_PROVIDER':'postgresql','DB_SSLMODE':'require','DB_CONNECT_TIMEOUT':'10','AUTO_MIGRATE':'false','MIGRATE_SQLITE_DATA':'false','SQLITE_SOURCE_PATH':'data/nacelux.db'})
+    values=read_env()
+    if not values.get('DATABASE_URL') or values.get('DATABASE_URL')==url:
+        raise SystemExit('Keep a separate non-owner DATABASE_URL for the runtime; this command writes only MIGRATION_DATABASE_URL.')
+    values.update({'MIGRATION_DATABASE_URL':url,'DB_PROVIDER':'postgresql','DB_SSLMODE':'require','DB_CONNECT_TIMEOUT':'10','AUTO_MIGRATE':'true','MIGRATE_SQLITE_DATA':'false','SQLITE_SOURCE_PATH':'data/nacelux.db'})
     ENV_FILE.write_text('\n'.join(f'{k}={v}' for k,v in values.items())+'\n',encoding='utf-8');os.chmod(ENV_FILE,0o600)
-    print(f'Configuration written to {ENV_FILE} with permissions 0600.')
-    print('Testing connection only — no migrations...')
-    result=subprocess.run([sys.executable,str(ROOT/'scripts'/'supabase_db.py'),'test'],cwd=ROOT)
-    if result.returncode:raise SystemExit('Connection test failed. Verify the rotated password and Session Pooler region.')
-    print('Connection successful. AUTO_MIGRATE=false and MIGRATE_SQLITE_DATA=false remain enforced.')
+    print(f'Migration configuration written to {ENV_FILE} with permissions 0600.')
+    print('No migration was executed. The runtime DATABASE_URL remains separate and must use a non-owner RLS role.')
 
 if __name__=='__main__':main()

@@ -9,13 +9,15 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
-      - NACELUX_ENV=production
+      - NACELUX_ENV=development
       - PROCESS_TYPE=web
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
       - DB_PROVIDER=postgresql
+      - DB_SSLMODE=disable
       - AUTO_MIGRATE=true
-      - MIGRATE_SQLITE_DATA=true
-      - LBR_RESA_ENABLED=true
+      - MIGRATE_SQLITE_DATA=false
+      - DOCUMENT_STORAGE_PROVIDER=local
+      - LBR_RESA_ENABLED=false
       - PDF_OCR_ENABLED=true
     depends_on:
       postgres:
@@ -29,11 +31,14 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      - NACELUX_ENV=development
       - PROCESS_TYPE=worker
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
       - DB_PROVIDER=postgresql
+      - DB_SSLMODE=disable
       - AUTO_MIGRATE=false
-      - LBR_RESA_ENABLED=true
+      - DOCUMENT_STORAGE_PROVIDER=local
+      - LBR_RESA_ENABLED=false
       - PDF_OCR_ENABLED=true
       - WORKER_INTERVAL_SECONDS=5.0
     depends_on:
