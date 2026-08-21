@@ -57,5 +57,14 @@ class HealthApiTests(unittest.TestCase):
             data = json.loads(res.read().decode())
             self.assertEqual(data.get('status'), 'HEALTHY')
 
+    def test_railway_liveness_probe_is_immediate_alive(self):
+        """Railway deploy probe hits /health and must return HTTP 200 without waiting on DB."""
+        req = Request(f"http://127.0.0.1:{self.port}/health")
+        with urlopen(req, timeout=2) as res:
+            self.assertEqual(res.status, 200)
+            payload = json.loads(res.read().decode())
+            self.assertEqual(payload.get('status'), 'ALIVE')
+            self.assertEqual(payload.get('version'), '2.1')
+
 if __name__ == '__main__':
     unittest.main()

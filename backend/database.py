@@ -80,13 +80,23 @@ def now(): return datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
 def init_db():
     if IS_POSTGRES:
         from migrations import run_migrations, migrate_sqlite_data, connection_test
-        # Production startup never mutates the schema unless explicitly enabled.
-        if os.getenv('AUTO_MIGRATE','false').lower() in ('1','true','yes'):
-            run_migrations()
-            if os.getenv('MIGRATE_SQLITE_DATA','false').lower() in ('1','true','yes'):
-                migrate_sqlite_data()
-        else:
-            connection_test()
+        try:
+            # Production startup never mutates the schema unless explicitly enabled.
+            if os.getenv('AUTO_MIGRATE','false').lower() in ('1','true','yes'):
+                print('[db] Running PostgreSQL migrations...')
+                run_migrations()
+                print('[db] Migrations applied.')
+                if os.getenv('MIGRATE_SQLITE_DATA','false').lower() in ('1','true','yes'):
+                    print('[db] Copying SQLite baseline into PostgreSQL...')
+                    migrate_sqlite_data()
+            else:
+                print('[db] AUTO_MIGRATE disabled; testing PostgreSQL connectivity...')
+                connection_test()
+                print('[db] PostgreSQL connection OK.')
+        except Exception as exc:
+            print(f'[db] ERROR: PostgreSQL initialization failed: {exc}')
+            print('[db] SQLite fallback is forbidden. Refusing to start.')
+            raise
         return
     with connect() as db:
         db.executescript(SCHEMA)
