@@ -1,0 +1,25 @@
+-- Functional SEO audits and versioned business signals. Additive only.
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS final_url text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS http_status integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS https_status text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS title text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS title_length integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS h1_count integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS h1_text text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS meta_description text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS meta_length integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS mobile_status text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS performance_score integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS response_ms integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS page_size_bytes integer;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS canonical_url text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS robots_meta text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS audit_method text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS error_code text;
+ALTER TABLE seo_audits ADD COLUMN IF NOT EXISTS error_message text;
+ALTER TABLE business_signals ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE business_signals ADD COLUMN IF NOT EXISTS first_detected_at timestamptz;
+ALTER TABLE business_signals ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE business_signals ADD COLUMN IF NOT EXISTS evidence jsonb NOT NULL DEFAULT '{}';
+CREATE UNIQUE INDEX IF NOT EXISTS business_signals_company_type_uidx ON business_signals(organization_id,company_id,signal_type);
+CREATE INDEX IF NOT EXISTS seo_audits_score_idx ON seo_audits(organization_id,seo_score,opportunity_score);
