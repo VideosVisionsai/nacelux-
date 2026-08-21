@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - NACELUX_ENV=production
+      - PROCESS_TYPE=web
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
+      - DB_PROVIDER=postgresql
+      - AUTO_MIGRATE=true
+      - MIGRATE_SQLITE_DATA=true
+      - LBR_RESA_ENABLED=true
+      - PDF_OCR_ENABLED=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - nacelux_data:/app/data
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PROCESS_TYPE=worker
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
+      - DB_PROVIDER=postgresql
+      - AUTO_MIGRATE=false
+      - LBR_RESA_ENABLED=true
+      - PDF_OCR_ENABLED=true
+      - WORKER_INTERVAL_SECONDS=5.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - nacelux_data:/app/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  nacelux_data:
+  postgres_data:

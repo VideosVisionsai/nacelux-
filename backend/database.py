@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS opportunity_scores(id TEXT PRIMARY KEY,organization_i
 CREATE INDEX IF NOT EXISTS idx_opp_score ON opportunity_scores(organization_id,score DESC);
 CREATE TABLE IF NOT EXISTS prospects(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,status TEXT,priority TEXT,owner TEXT,assigned_to TEXT,notes TEXT,next_action TEXT,next_action_date TEXT,last_contacted_at TEXT,created_at TEXT,updated_at TEXT,UNIQUE(organization_id,company_id));
 CREATE TABLE IF NOT EXISTS data_sources(id TEXT PRIMARY KEY,organization_id TEXT,name TEXT,source_type TEXT,base_url TEXT,status TEXT,last_run_at TEXT,records_count INTEGER DEFAULT 0,note TEXT);
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,organization_id TEXT,job_type TEXT,status TEXT,started_at TEXT,finished_at TEXT,records_processed INTEGER DEFAULT 0,error TEXT);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,organization_id TEXT,job_type TEXT,status TEXT,started_at TEXT,finished_at TEXT,records_processed INTEGER DEFAULT 0,error TEXT,payload TEXT DEFAULT '{}',attempt INTEGER DEFAULT 0,schedule TEXT);
 CREATE TABLE IF NOT EXISTS data_lineage(id TEXT PRIMARY KEY,organization_id TEXT,entity_type TEXT,entity_id TEXT,field_name TEXT,source_id TEXT,source_url TEXT,document_id TEXT,retrieved_at TEXT,confidence REAL,method TEXT);
 CREATE TABLE IF NOT EXISTS audit_logs(id TEXT PRIMARY KEY,organization_id TEXT,user_id TEXT,action TEXT,entity_type TEXT,entity_id TEXT,metadata TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS nace_codes(id TEXT PRIMARY KEY,version TEXT NOT NULL,code TEXT NOT NULL,level TEXT NOT NULL,title_fr TEXT,title_de TEXT,title_en TEXT,parent_code TEXT,includes_text TEXT,excludes_text TEXT,source_status TEXT,source_url TEXT,is_demo INTEGER DEFAULT 1,UNIQUE(version,code));
@@ -104,6 +104,9 @@ def init_db():
         for name,kind in {'status':"TEXT DEFAULT 'ACTIVE'",'first_detected_at':'TEXT','last_seen_at':'TEXT','evidence':"TEXT DEFAULT '{}'",'severity':'TEXT','rule_version':'TEXT','explanation':'TEXT','expires_at':'TEXT','data_quality':"TEXT DEFAULT 'UNKNOWN'"}.items():
             if name not in signal_existing:db.execute(f'ALTER TABLE business_signals ADD COLUMN {name} {kind}')
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_business_signal_unique ON business_signals(organization_id,company_id,signal_type)")
+        jobs_existing={r['name'] for r in db.execute("PRAGMA table_info(jobs)")}
+        for name,kind in {'payload':"TEXT DEFAULT '{}'",'attempt':'INTEGER DEFAULT 0','schedule':'TEXT'}.items():
+            if name not in jobs_existing:db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         people_existing={r['name'] for r in db.execute("PRAGMA table_info(people)")}
         for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT'}.items():
             if name not in people_existing:db.execute(f'ALTER TABLE people ADD COLUMN {name} {kind}')
@@ -117,8 +120,8 @@ def init_db():
                 created=(datetime.utcnow()-timedelta(days=days)).date().isoformat()
                 db.execute("""INSERT INTO companies(id,organization_id,company_name,legal_form,rcs_number,creation_date,status,business_object,primary_nace_code,category,niche,subniche,website,canton,municipality,locality,postal_code,website_status,digital_score,seo_score,seo_opportunity,google_status,decision_maker_status,niche_attractiveness,commercial_potential,source_status,source_name,is_demo,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (cid,ORG_ID,name,form,rcs,created,"ACTIVE","Demonstration record — not sourced from a registry.",nace,cat,niche,sub,web,canton,muni,locality,postal,ws,ds,seo,seoop,google,dm,attr,potential,"DEMO","NACELUX demo seed",1,ts,ts))
-        sources=[("src_lbr","LBR / RESA","OFFICIAL","https://www.lbr.lu/","NOT_CONNECTED","No undocumented API assumed. Compliance review required."),("src_nace","Eurostat NACE Rev. 2.1","OFFICIAL","https://ec.europa.eu/eurostat/web/nace","NOT_CONNECTED","Official source identified; import endpoint not configured."),("src_web","Website analysis","PUBLIC_WEB",None,"READY","On-demand analyzer boundary; no checks run on demo data.")]
-        for s in sources: db.execute("INSERT OR IGNORE INTO data_sources(id,organization_id,name,source_type,base_url,status,note) VALUES(?,?,?,?,?,?,?)",(s[0],ORG_ID,*s[1:]))
+        sources=[("src_nace","Eurostat NACE Rev. 2.1","OFFICIAL","https://ec.europa.eu/eurostat/web/nace","VERIFIED","Official ShowVoc RDF distribution identified and verified."),("src_lbr","LBR / RESA","OFFICIAL","https://www.lbr.lu/","REQUIRES OFFICIAL CONFIRMATION","Controlled public journal reader. No undocumented API assumed; official B2B confirmation required."),("src_web","Website Analysis","INTERNAL_SERVICE",None,"INTERNAL SERVICE","Internal backend analyzer boundary; runs with SSRF and redirect protection.")]
+        for s in sources: db.execute("INSERT OR REPLACE INTO data_sources(id,organization_id,name,source_type,base_url,status,note) VALUES(?,?,?,?,?,?,?)",(s[0],ORG_ID,*s[1:]))
         # Demonstration taxonomy: explicitly non-official until a verified Eurostat import runs.
         nace=[('62.10','CLASS','Programmation informatique','Programmierungstätigkeiten','Computer programming activities','62'),('70.20','CLASS','Conseil pour les affaires','Unternehmensberatung','Business and management consultancy','70'),('74.12','CLASS','Activités de design graphique','Grafikdesign','Graphic design activities','74'),('68.31','CLASS','Activités des agences immobilières','Immobilienvermittlung','Real estate agency activities','68'),('81.30','CLASS','Services d’aménagement paysager','Garten- und Landschaftsbau','Landscape service activities','81'),('66.19','CLASS','Activités auxiliaires des services financiers','Sonstige Finanzdienstleistungen','Other financial service support activities','66')]
         for code,level,fr,de,en,parent in nace: db.execute("INSERT OR IGNORE INTO nace_codes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",('nace_'+code.replace('.','_'),'2.1',code,level,fr,de,en,parent,'Demonstration label only',None,'DEMO','https://ec.europa.eu/eurostat/web/nace',1))
@@ -146,8 +149,14 @@ def recalculate_all(db, org_id):
     except sqlite3.OperationalError: weights={}
     for c in companies:
         result=calculate(c,weights); oid="opp_"+c["id"]
+        breakdown_data={
+            "factors": result["factors"],
+            "model_version": result["model_version"],
+            "provenance_fingerprint": result["provenance_fingerprint"],
+            "input_snapshot": result["input_snapshot"]
+        }
         db.execute("""INSERT INTO opportunity_scores(id,organization_id,company_id,score,level,breakdown,recommended_action,calculated_at)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(result["factors"]),result["action"],now()))
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(breakdown_data),result["action"],now()))
 
 def list_companies(org_id, q):
     where=["c.organization_id=?"]; params=[org_id]
@@ -172,7 +181,17 @@ def company_detail(org_id,cid):
     c=one("""SELECT c.*,o.score opportunity_score,o.level opportunity_level,o.breakdown,o.recommended_action,o.calculated_at FROM companies c JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE c.organization_id=? AND c.id=?""",(org_id,cid))
     if c:
         raw_breakdown=c.get("breakdown") or []
-        c["breakdown"]=json.loads(raw_breakdown) if isinstance(raw_breakdown,str) else raw_breakdown
+        parsed=json.loads(raw_breakdown) if isinstance(raw_breakdown,str) else raw_breakdown
+        if isinstance(parsed,dict) and "factors" in parsed:
+            c["breakdown"]=parsed["factors"]
+            c["scoring_provenance"]={
+                "model_version":parsed.get("model_version"),
+                "provenance_fingerprint":parsed.get("provenance_fingerprint"),
+                "input_snapshot":parsed.get("input_snapshot")
+            }
+        else:
+            c["breakdown"]=parsed if isinstance(parsed,list) else []
+            c["scoring_provenance"]=None
         c["signals"]=rows("SELECT * FROM business_signals WHERE organization_id=? AND company_id=?",(org_id,cid))
         c["lineage"]=rows("SELECT * FROM data_lineage WHERE organization_id=? AND entity_id=?",(org_id,cid))
         c["prospect"]=one("SELECT * FROM prospects WHERE organization_id=? AND company_id=?",(org_id,cid))
