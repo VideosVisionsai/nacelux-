@@ -149,8 +149,14 @@ def recalculate_all(db, org_id):
     except sqlite3.OperationalError: weights={}
     for c in companies:
         result=calculate(c,weights); oid="opp_"+c["id"]
+        breakdown_data={
+            "factors": result["factors"],
+            "model_version": result["model_version"],
+            "provenance_fingerprint": result["provenance_fingerprint"],
+            "input_snapshot": result["input_snapshot"]
+        }
         db.execute("""INSERT INTO opportunity_scores(id,organization_id,company_id,score,level,breakdown,recommended_action,calculated_at)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(result["factors"]),result["action"],now()))
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(breakdown_data),result["action"],now()))
 
 def list_companies(org_id, q):
     where=["c.organization_id=?"]; params=[org_id]
@@ -175,7 +181,17 @@ def company_detail(org_id,cid):
     c=one("""SELECT c.*,o.score opportunity_score,o.level opportunity_level,o.breakdown,o.recommended_action,o.calculated_at FROM companies c JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE c.organization_id=? AND c.id=?""",(org_id,cid))
     if c:
         raw_breakdown=c.get("breakdown") or []
-        c["breakdown"]=json.loads(raw_breakdown) if isinstance(raw_breakdown,str) else raw_breakdown
+        parsed=json.loads(raw_breakdown) if isinstance(raw_breakdown,str) else raw_breakdown
+        if isinstance(parsed,dict) and "factors" in parsed:
+            c["breakdown"]=parsed["factors"]
+            c["scoring_provenance"]={
+                "model_version":parsed.get("model_version"),
+                "provenance_fingerprint":parsed.get("provenance_fingerprint"),
+                "input_snapshot":parsed.get("input_snapshot")
+            }
+        else:
+            c["breakdown"]=parsed if isinstance(parsed,list) else []
+            c["scoring_provenance"]=None
         c["signals"]=rows("SELECT * FROM business_signals WHERE organization_id=? AND company_id=?",(org_id,cid))
         c["lineage"]=rows("SELECT * FROM data_lineage WHERE organization_id=? AND entity_id=?",(org_id,cid))
         c["prospect"]=one("SELECT * FROM prospects WHERE organization_id=? AND company_id=?",(org_id,cid))

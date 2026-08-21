@@ -1,65 +1,45 @@
-# Connecteur officiel-public LBR / RESA
+# Connecteur LBR / RESA (Luxembourg) — Spécification & Statut
 
-## Limite d’intégration
+> **STATUT DE CONFORMITÉ : `REQUIRES OFFICIAL CONFIRMATION`**  
+> Ce connecteur n'utilise **aucune API REST officielle documentée** par l'État luxembourgeois car aucune API publique ouverte n'est mise à disposition par le G.I.E. LBR.  
+> Toute utilisation en production doit faire l'objet d'une convention d'accès B2B ou respecter scrupuleusement les limitations techniques et légales ci-dessous.
 
-Le connecteur utilise uniquement les pages publiques canoniques:
+---
 
-`https://www.lbr.lu/mjrcs-web-front/publication-journal/RESA-YYYY_…`
+## 1. Méthode Actuelle d'Ingestion (Passerelle Publique Contrôlée)
 
-Il n’appelle pas `/mjrcs-web-api`, `/mjrcs-web-front/api` ou une API supposée. `robots.txt` est contrôlé avant chaque analyse. Au 20 août 2026, le chemin public `publication-journal` n’est pas interdit, tandis que plusieurs chemins API/auth le sont.
+Le connecteur accède uniquement aux URLs canoniques des publications publiques journalières du RESA :
+`https://www.lbr.lu/mjrcs-web-front/publication-journal/RESA-YYYY_SEQ_...`
 
-## Pipeline
+1. **Validation d'URL & Protocole** : Vérification stricte du domaine `www.lbr.lu`, schéma `https` obligatoire.
+2. **Respect de `robots.txt`** : Vérification systématique avant chaque tentative. Le chemin `publication-journal` est autorisé pour la consultation publique.
+3. **HTTP First $\to$ Headless Browser Fallback** : Tentative de lecture HTML statique ; bascule sur Playwright uniquement si le rendu DOM JavaScript est exigé.
+4. **Détection CAPTCHA (Friendly Captcha)** : Détection passive. **Aucun contournement, solver ou bypass n'est implémenté**. Si le Captcha bloque le rendu, le run est immédiatement consigné comme `BLOCKED` / `CAPTCHA_REQUIRED` et s'arrête proprement.
+5. **Rate-Limiting & Espacement** : Délai minimum de 8 secondes entre requêtes consécutives (`LBR_RESA_MIN_INTERVAL_SECONDS`).
+6. **User-Agent Identifiable** : `NACELUX/1.0 (+https://votre-domaine.lu/data-policy; contact@votre-domaine.lu)`.
+7. **Conservation des Preuves & Empreinte** : SHA-256 de chaque document PDF téléchargé avec stockage immuable dédupliqué et trace d'audit complète.
 
-1. Validation stricte du host, HTTPS et chemin.
-2. Consultation de `robots.txt`.
-3. Requête HTML standard avec user-agent identifiable.
-4. Si aucune ligne n’est disponible parce que la page est rendue en JavaScript, lancement de Playwright.
-5. Détection conservative des lignes visibles et liens documentaires.
-6. Blocage explicite si Friendly Captcha reste requis. Aucun contournement.
-7. Normalisation RCS et extraction uniquement des champs explicitement libellés.
-8. Hash du snapshot, des lignes et URLs.
-9. Upsert idempotent des journaux, lignes et documents.
-10. Historique complet du run et artefact HTML local pour adapter les sélecteurs.
+---
 
-## Modèle
+## 2. Limites & Risques Techniques
 
-- `resa_journals`
-- `resa_entries`
-- `resa_documents`
-- `resa_sync_runs`
+* **Instabilité UI** : Toute modification du DOM de l'interface `mjrcs-web-front` par le LBR peut altérer la détection des lignes.
+* **Blocages IP / WAF** : En cas de trafic trop soutenu, l'infrastructure du LBR peut élever le niveau de challenge Friendly Captcha.
+* **Volume** : Limité aux publications du jour ou consultées à la demande.
 
-La migration `0003_lbr_resa_connector.sql` est additive. Aucun objet existant n’est supprimé.
+---
 
-## Statuts
+## 3. Démarche pour Passage en Production B2B Certifiée
 
-- Run: `RUNNING`, `SUCCESS`, `BLOCKED`, `FAILED`, `INVALIDATED`
-- Changement ligne: `NEW`, `UPDATED`, `UNCHANGED`, `DUPLICATE`
-- Captcha: `NOT_PRESENT`, `RESOLVED`, `REQUIRED`
-- Documents: `NOT_DOWNLOADED`, puis pipeline futur de téléchargement/extraction
-- Type: `PDF` uniquement si l’URL l’indique explicitement; sinon `PUBLIC_DOCUMENT_LINK`
+Pour une exploitation commerciale à grande échelle sans dépendance à l'interface HTML :
+1. **Convention B2B LBR** : Souscrire à l'accès professionnel officiel proposé par le G.I.E. Registre de Commerce et des Sociétés.
+2. **Accès EDI / Flux Direct** : Remplacer l'adaptateur de parsing HTML par le connecteur certifié LBR une fois les identifiants de passerelle délivrés.
 
-Une page rendue avec zéro ligne n’est jamais déclarée réussie.
+---
 
-## Configuration
+## 4. Modèle de Données & Tables Associées
 
-```env
-LBR_RESA_ENABLED=true
-LBR_RESA_HEADLESS=true
-LBR_RESA_TIMEOUT_MS=45000
-LBR_RESA_MIN_INTERVAL_SECONDS=8
-LBR_USER_AGENT=NACELUX/1.0 (+https://your-domain.example/data-policy; contact@example.com)
-LBR_RESA_ARTIFACT_DIR=data/resa-artifacts
-```
-
-L’activation doit suivre une validation interne des conditions LBR et une fréquence raisonnable. Pour un captcha nécessitant une interaction légitime, un opérateur peut lancer un navigateur visible:
-
-```bash
-python3 -m playwright install chromium
-python3 scripts/resa_sync.py --headed 'https://www.lbr.lu/mjrcs-web-front/publication-journal/RESA-…'
-```
-
-Le mode `--headed` n’automatise pas la résolution du captcha.
-
-## Synchronisations futures
-
-`RESA_SYNC` accepte une `source_url`, crée un run auditable et reste idempotent. Un scheduler pourra fournir les URLs de journaux connues sans modifier la logique de stockage. La découverte automatique de journaux n’est pas activée tant qu’un parcours public conforme n’a pas été validé.
+* `resa_journals` : Clé du journal, date, séquence, hash du contenu.
+* `resa_entries` : Ligne extraite, dénomination, numéro RCS, extrait légal, statut de changement (`NEW`, `UPDATED`, `UNCHANGED`).
+* `resa_documents` : Lien de téléchargement, SHA-256, statut d'extraction et de stockage.
+* `resa_sync_runs` : Trace d'exécution auditable (date, méthode, captcha, robots, erreurs).

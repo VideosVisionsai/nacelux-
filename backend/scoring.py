@@ -1,3 +1,4 @@
+import hashlib, json
 from datetime import date, datetime
 
 DEFAULT_WEIGHTS = {
@@ -9,6 +10,7 @@ DEFAULT_WEIGHTS = {
     "decision_maker": 5,
     "commercial_potential": 10,
 }
+MODEL_VERSION = "nacelux-scoring-2.1"
 
 
 def _age_days(value):
@@ -19,7 +21,9 @@ def _age_days(value):
 
 
 def calculate(company, weights=None):
-    """Deterministic score. Unknown data earns no points; it is never guessed."""
+    """Deterministic score. Unknown data earns no points; it is never guessed.
+    Includes full input snapshot and cryptographic provenance fingerprint for exact reproducibility.
+    """
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
     factors = []
 
@@ -68,5 +72,27 @@ def calculate(company, weights=None):
     else:
         action = "MONITOR"
 
-    return {"score": score, "level": level, "action": action,
-            "factors": [{"key": key, "label": label, "points": points, "max": w[key]} for key, label, points in factors]}
+    # Input snapshot and cryptographic fingerprint for reproducibility
+    input_snapshot = {
+        "creation_date": company.get("creation_date"),
+        "website_status": company.get("website_status"),
+        "digital_score": company.get("digital_score"),
+        "seo_opportunity": company.get("seo_opportunity"),
+        "google_status": company.get("google_status"),
+        "decision_maker_status": company.get("decision_maker_status"),
+        "niche_attractiveness": company.get("niche_attractiveness"),
+        "commercial_potential": company.get("commercial_potential"),
+        "weights": w,
+        "model_version": MODEL_VERSION
+    }
+    fingerprint = hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    return {
+        "score": score,
+        "level": level,
+        "action": action,
+        "model_version": MODEL_VERSION,
+        "provenance_fingerprint": fingerprint,
+        "input_snapshot": input_snapshot,
+        "factors": [{"key": key, "label": label, "points": points, "max": w[key]} for key, label, points in factors]
+    }
