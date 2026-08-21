@@ -27,7 +27,7 @@ Functional MVP foundation for **Luxembourg Business Opportunity Intelligence**.
 - Stored PDF → native page text → quality checks → selective FR/DE/EN Tesseract OCR fallback
 - Import validation/deduplication preview API
 - Report history and CSV export using the current filters
-- Demo-mode disclosure: seeded records are clearly labelled and never presented as official
+- Development fixtures are isolated from production; production fails closed if PostgreSQL or Supabase Auth is unavailable
 
 ## Run
 
@@ -47,12 +47,12 @@ HTTP API + tenant guard
        ↓
 services (scoring, provenance, exports)
        ↓
-SQLite dev repository / PostgreSQL production target
+Explicit SQLite development adapter / PostgreSQL production runtime with TLS
        ↓
 connectors (LBR/RESA, Eurostat — disabled until configured and verified)
 ```
 
-The runtime intentionally has no third-party dependency. SQLite makes the MVP runnable in Arena. `database/postgresql_schema.sql` is the production relational design and uses UUIDs, JSONB, tenant indexes and row-level-security hooks.
+Development can run with the standard-library SQLite adapter; the production image installs psycopg, PDF/OCR dependencies and requires PostgreSQL over TLS. `database/postgresql_schema.sql` documents the relational design, while additive deployment migrations install the active production schema and RLS policies.
 
 ## External integrations
 
@@ -62,7 +62,7 @@ The runtime intentionally has no third-party dependency. SQLite makes the MVP ru
 
 ## Security notes
 
-The demo session uses an organization header generated server-side. Production requires replacing `DemoAuthProvider` with secure sessions, password hashing, CSRF protection and PostgreSQL RLS. Every repository query is tenant-scoped. Secrets belong server-side only.
+Development may use seeded fixtures, but production requires Supabase Auth, HttpOnly/Secure/SameSite cookies, CSRF protection, PostgreSQL TLS and RLS tenant context. Production startup fails closed and never creates a development workspace. Secrets belong server-side only.
 
 ## Key directories
 

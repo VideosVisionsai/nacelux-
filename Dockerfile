@@ -44,7 +44,7 @@ RUN mkdir -p data/document-storage data/resa-artifacts data/nace-imports && \
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 ENV NACELUX_ENV=production
-ENV DOCUMENT_STORAGE_PROVIDER=local
+ENV DOCUMENT_STORAGE_PROVIDER=supabase
 ENV PDF_OCR_ENABLED=true
 ENV PDF_OCR_LANGUAGES=fra+deu+eng
 

@@ -5,10 +5,33 @@ import json, os, secrets, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 import config
+from db_adapter import IS_POSTGRES
 
 SUPABASE_URL=os.getenv('SUPABASE_URL','').rstrip('/')
 ANON_KEY=os.getenv('SUPABASE_ANON_KEY','')
-AUTH_ENABLED=bool(SUPABASE_URL and ANON_KEY and 'replace-with' not in ANON_KEY)
+_PRODUCTION=os.getenv('NACELUX_ENV','development').lower() in ('production','prod')
+
+def _looks_configured(value):
+    lowered=(value or '').lower()
+    return bool(value) and not any(marker in lowered for marker in ('replace-with','your_','votre','<project','<key','example'))
+
+def validate_production_auth():
+    parsed=urllib.parse.urlsplit(SUPABASE_URL)
+    if parsed.scheme!='https' or not parsed.hostname or not _looks_configured(SUPABASE_URL):
+        raise RuntimeError('SUPABASE_URL must be a configured HTTPS URL in production')
+    if not _looks_configured(ANON_KEY):
+        raise RuntimeError('SUPABASE_ANON_KEY is required for Supabase Auth in production')
+    if os.getenv('AUTH_COOKIE_SECURE','').lower() not in ('1','true','yes'):
+        raise RuntimeError('AUTH_COOKIE_SECURE=true is required in production')
+    if not _looks_configured(os.getenv('AUTH_REDIRECT_URL','')):
+        raise RuntimeError('AUTH_REDIRECT_URL is required for Supabase Auth in production')
+    redirect=urllib.parse.urlsplit(os.getenv('AUTH_REDIRECT_URL',''))
+    if redirect.scheme!='https' or not redirect.hostname:
+        raise RuntimeError('AUTH_REDIRECT_URL must be an HTTPS URL in production')
+
+if _PRODUCTION:
+    validate_production_auth()
+AUTH_ENABLED=bool(SUPABASE_URL and ANON_KEY and _looks_configured(ANON_KEY))
 ACCESS_COOKIE='nacelux_access'
 REFRESH_COOKIE='nacelux_refresh'
 CSRF_COOKIE='nacelux_csrf'
@@ -84,7 +107,10 @@ def ensure_workspace(auth_user,db_connect):
         membership=db.execute('SELECT m.organization_id,m.role,o.name FROM organization_members m JOIN organizations o ON o.id=m.organization_id WHERE m.user_id=? ORDER BY CASE m.role WHEN \'OWNER\' THEN 1 WHEN \'ADMIN\' THEN 2 ELSE 3 END LIMIT 1',(user_id,)).fetchone()
         if not membership:
             org_id='org_'+uuid.uuid4().hex;org_name=f"{name}'s workspace";slug='workspace-'+uuid.uuid4().hex[:12]
-            db.execute('INSERT INTO organizations(id,name,slug,created_at) VALUES(?,?,?,?)',(org_id,org_name,slug,ts))
-            db.execute('INSERT INTO organization_members(organization_id,user_id,role) VALUES(?,?,?)',(org_id,user_id,'OWNER'))
+            if IS_POSTGRES:
+                db.execute('SELECT app_provision_workspace(?,?,?,?)',(org_id,org_name,slug,user_id))
+            else:
+                db.execute('INSERT INTO organizations(id,name,slug,created_at) VALUES(?,?,?,?)',(org_id,org_name,slug,ts))
+                db.execute('INSERT INTO organization_members(organization_id,user_id,role) VALUES(?,?,?)',(org_id,user_id,'OWNER'))
             membership={'organization_id':org_id,'role':'OWNER','name':org_name}
     return {'user_id':user_id,'email':email,'display_name':name,'organization_id':membership['organization_id'],'organization_name':membership['name'],'role':membership['role']}

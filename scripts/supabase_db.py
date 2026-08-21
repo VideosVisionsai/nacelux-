@@ -22,6 +22,11 @@ def main():
     args=p.parse_args()
     if not DATABASE_URL:
         raise SystemExit('DATABASE_URL is missing. Copy .env.example to .env and add the Supabase PostgreSQL URI.')
+    from db_adapter import is_production, validate_production_database_config
+    if is_production():
+        validate_production_database_config()
+        if args.command=='copy-sqlite' or os.getenv('MIGRATE_SQLITE_DATA','false').lower() in ('1','true','yes'):
+            raise SystemExit('SQLite data copy is forbidden in NACELUX_ENV=production')
     from migrations import connection_test,run_migrations,migrate_sqlite_data
     if args.command=='test': result=connection_test()
     elif args.command=='migrate': result={'migrations':run_migrations()}
