@@ -38,15 +38,21 @@ Ce guide fournit toutes les instructions pour déployer NACELUX en production su
 Dans Railway, va dans l'onglet **Variables** du service et ajoute :
 
 ```env
-DATABASE_URL=postgresql://postgres.VOTRE_REF:MOT_DE_PASSE@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+DATABASE_URL=postgresql://postgres.VOTRE_REF:PASSWORD@aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require
 DB_PROVIDER=postgresql
+DB_SSLMODE=require
+MIGRATION_DATABASE_URL=postgresql://postgres.VOTRE_REF:PASSWORD@aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require
 SUPABASE_URL=https://VOTRE_REF.supabase.co
-SUPABASE_ANON_KEY=eyJhbGciOi...
-SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOi...
+SUPABASE_ANON_KEY=<server-side-anon-key>
+SUPABASE_SERVICE_ROLE_KEY=<server-side-service-role-key>
+SUPABASE_STORAGE_BUCKET=resa-documents
+DOCUMENT_STORAGE_PROVIDER=supabase
 AUTH_REDIRECT_URL=https://votre-app.up.railway.app
 AUTH_COOKIE_SECURE=true
 AUTO_MIGRATE=true
-LBR_RESA_ENABLED=true
+MIGRATE_SQLITE_DATA=false
+NACELUX_ENV=production
+LBR_RESA_ENABLED=false
 PDF_OCR_ENABLED=true
 PORT=8000
 ```
@@ -67,7 +73,8 @@ Dans le même projet Railway :
 
 1. **Database** :
    - Récupère l'URI de connexion dans **Project Settings → Database → Connection string (Session pooler)**.
-   - Assure-toi que `AUTO_MIGRATE=true` est activé : au premier démarrage, le script `start.sh` applique automatiquement les migrations `0001` à `0011` sans intervention manuelle.
+   - Assure-toi que `AUTO_MIGRATE=true` est activé : au démarrage, `start.sh` applique automatiquement les migrations additives `0001` à `0014` sans intervention manuelle.
+   - Le rôle runtime web/worker ne doit pas être propriétaire des tables tenant et ne doit pas avoir `BYPASSRLS`. Accorde uniquement `EXECUTE` sur `app_claim_jobs` et `app_reap_orphan_jobs` au rôle worker dédié.
 2. **Authentication** :
    - Dans **Authentication → URL Configuration**, ajoute l'URL de ton application Railway dans **Site URL** et **Redirect URLs**.
 3. **Storage** :
@@ -114,7 +121,8 @@ python3 scripts/import_nace21.py
 
 | Endpoint | Méthode | Rôle |
 |---|---|---|
-| `/health` ou `/api/v1/health` | GET | Statut global, base de données, stockage, OCR, connecteurs |
+| `/health` | GET | Liveness immédiate, `ALIVE`, sans accès DB |
+| `/api/v1/health` | GET | Readiness PostgreSQL/stockage/OCR/connecteurs, `503` si DB indisponible |
 | `/api/v1/health/database` | GET | Statut détaillé de la connexion PostgreSQL Supabase |
 | `/api/v1/session` | GET | Session active, utilisateur et tenant courant |
 | `/api/v1/jobs` | POST | Déclenchement d'un job asynchrone (OCR, SEO, RESA, NACE...) |

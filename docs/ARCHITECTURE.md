@@ -2,7 +2,7 @@
 
 ## Décisions
 
-**MVP Arena:** Python 3 standard library, API REST, SQLite et SPA sans dépendance. Ce choix rend le produit immédiatement exécutable. **Production:** PostgreSQL, workers séparés, object storage et reverse proxy.
+**Development/Test:** Python 3 standard library, API REST, explicit SQLite adapter and SPA without dependencies. **Production:** PostgreSQL over TLS, Supabase Auth, workers séparés, private object storage and reverse proxy. Production is fail-closed and never selects the development adapter.
 
 ### Composants cibles
 

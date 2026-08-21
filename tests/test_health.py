@@ -66,5 +66,36 @@ class HealthApiTests(unittest.TestCase):
             self.assertEqual(payload.get('status'), 'ALIVE')
             self.assertEqual(payload.get('version'), '2.1')
 
+    def test_readiness_never_returns_database_credentials(self):
+        original_connect = database.connect
+        original_backend = database.IS_POSTGRES
+        def broken_connect():
+            raise RuntimeError('postgresql://runtime:super-secret@db.example.test:5432/postgres?sslmode=require')
+        database.connect = broken_connect
+        database.IS_POSTGRES = True
+        try:
+            req = Request(f"http://127.0.0.1:{self.port}/api/v1/health")
+            with self.assertRaises(Exception) as caught:
+                urlopen(req, timeout=5)
+            response = caught.exception.read().decode() if hasattr(caught.exception, 'read') else str(caught.exception)
+            self.assertNotIn('super-secret', response)
+            self.assertNotIn('postgresql://', response)
+            self.assertIn('DATABASE_UNAVAILABLE', response)
+        finally:
+            database.connect = original_connect
+            database.IS_POSTGRES = original_backend
+
+    def test_job_api_writes_current_schema(self):
+        request = Request(
+            f"http://127.0.0.1:{self.port}/api/v1/jobs",
+            data=json.dumps({'job_type':'OPPORTUNITY_RECALCULATION'}).encode(),
+            headers={'Content-Type':'application/json'},
+            method='POST',
+        )
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 201)
+            payload = json.loads(response.read().decode())
+            self.assertEqual(payload.get('status'), 'SUCCESS')
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,8 +1,9 @@
 """Idempotent PostgreSQL migration runner and lossless SQLite copy utility."""
 import hashlib, json, os, sqlite3
 from pathlib import Path
-from db_adapter import DATABASE_URL, ROOT
+from db_adapter import DATABASE_URL, ROOT, connect as runtime_connect, validate_database_url
 
+MIGRATION_DATABASE_URL=os.getenv('MIGRATION_DATABASE_URL', DATABASE_URL).strip()
 MIGRATIONS=Path(os.getenv('MIGRATIONS_DIR',ROOT/'database'/'migrations'))
 TABLE_ORDER=['organizations','users','organization_members','companies','business_signals','opportunity_scores','prospects','data_sources','jobs','data_lineage','audit_logs','nace_codes','taxonomy_nodes','people','digital_checks','seo_audits','resa_publications','reports','territories','scoring_weights','resa_journals','resa_entries','resa_documents','resa_sync_runs','storage_objects','document_extractions','document_page_extractions','nace_versions_official','nace_items_official','nace_labels_official','nace_notes_official','nace_correspondences_official','nace_import_runs','website_discovery_runs','website_candidates','google_business_profiles','people_engine_runs','people_evidence','professional_profiles_public','privacy_requests','business_signal_runs','business_signal_definitions']
 JSON_COLUMNS={'companies':{'secondary_nace_codes'},'business_signals':{'signal_value','evidence'},'opportunity_scores':{'breakdown'},'audit_logs':{'metadata'},'digital_checks':{'details','evidence'},'seo_audits':{'findings'},'territories':{'municipalities'},'resa_sync_runs':{'metadata'},'nace_versions_official':{'metadata'},'nace_import_runs':{'metadata'},'website_discovery_runs':{'metadata'},'website_candidates':{'evidence'},'google_business_profiles':{'raw_data'},'people_engine_runs':{'metadata'},'professional_profiles_public':{'evidence'},'business_signal_runs':{'metadata'},'jobs':{'payload'}}
@@ -11,15 +12,19 @@ BOOL_COLUMNS={'companies':{'is_demo'},'nace_codes':{'is_demo'},'taxonomy_nodes':
 def pg_connect():
     import psycopg
     from psycopg.rows import dict_row
-    return psycopg.connect(DATABASE_URL,row_factory=dict_row,connect_timeout=int(os.getenv('DB_CONNECT_TIMEOUT','10')))
+    if not MIGRATION_DATABASE_URL: raise RuntimeError('MIGRATION_DATABASE_URL is required for PostgreSQL migrations')
+    validate_database_url(MIGRATION_DATABASE_URL, require_ssl=os.getenv('NACELUX_ENV','development').lower() in ('production','prod'))
+    options={'row_factory':dict_row,'connect_timeout':int(os.getenv('DB_CONNECT_TIMEOUT','10'))}
+    if os.getenv('NACELUX_ENV','development').lower() in ('production','prod'):
+        options['sslmode']='require'
+    return psycopg.connect(MIGRATION_DATABASE_URL,**options)
 
 def run_migrations():
     """Apply only unseen files. Every migration is additive and checksum tracked."""
-    if not DATABASE_URL: raise RuntimeError('DATABASE_URL is required for PostgreSQL migrations')
+    if not MIGRATION_DATABASE_URL: raise RuntimeError('MIGRATION_DATABASE_URL is required for PostgreSQL migrations')
     files=sorted(MIGRATIONS.glob('*.sql'))
     if not files: raise RuntimeError(f'No migrations found in {MIGRATIONS}')
     with pg_connect() as conn:
-        # Bootstrap tracker independently because the first migration also declares it.
         conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version text PRIMARY KEY,checksum text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())")
         for path in files:
             sql=path.read_text(encoding='utf-8'); digest=hashlib.sha256(sql.encode()).hexdigest(); version=path.stem
@@ -61,7 +66,8 @@ def migrate_sqlite_data(source=None):
     src.close();return {'source':str(source),'tables':stats,'total':sum(stats.values())}
 
 def connection_test():
-    with pg_connect() as conn:
+    """Test the non-owner runtime connection, not the migration administrator."""
+    with runtime_connect() as conn:
         row=conn.execute("SELECT current_database() database,current_user db_user,version() version,now() checked_at").fetchone()
         tables=conn.execute("SELECT count(*) count FROM information_schema.tables WHERE table_schema='public'").fetchone()['count']
-    return {**dict(row),'public_tables':tables,'ssl_required':True}
+    return {**dict(row),'public_tables':tables,'ssl_required':True,'rls_runtime_role_checked':True}

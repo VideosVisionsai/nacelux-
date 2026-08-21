@@ -51,7 +51,24 @@ class SupabaseStorage:
             detail=exc.read(1000).decode('utf-8','replace');raise RuntimeError(f'Supabase Storage upload failed ({exc.code}): {detail}')
         return StoredObject(self.provider,self.bucket,key)
 
-def storage_backend():return SupabaseStorage() if os.getenv('DOCUMENT_STORAGE_PROVIDER','local').lower()=='supabase' else LocalStorage()
+def validate_production_storage_config():
+    if os.getenv('NACELUX_ENV','development').lower() not in ('production','prod'):
+        return
+    provider=os.getenv('DOCUMENT_STORAGE_PROVIDER','').lower()
+    if provider!='supabase':
+        raise RuntimeError('DOCUMENT_STORAGE_PROVIDER=supabase is required in production')
+    required=(os.getenv('SUPABASE_URL',''),os.getenv('SUPABASE_SERVICE_ROLE_KEY',''),os.getenv('SUPABASE_STORAGE_BUCKET',''))
+    if any(not value or any(marker in value.lower() for marker in ('replace-with','your_','<key','example')) for value in required):
+        raise RuntimeError('Supabase private storage configuration is incomplete in production')
+
+if os.getenv('NACELUX_ENV','development').lower() in ('production','prod'):
+    validate_production_storage_config()
+
+def storage_backend():
+    provider=os.getenv('DOCUMENT_STORAGE_PROVIDER','supabase' if os.getenv('NACELUX_ENV','development').lower() in ('production','prod') else 'local').lower()
+    if os.getenv('NACELUX_ENV','development').lower() in ('production','prod') and provider!='supabase':
+        raise RuntimeError('Supabase Storage is required in production; local document storage is forbidden')
+    return SupabaseStorage() if provider=='supabase' else LocalStorage()
 
 class ResaPdfStoragePipeline:
     def __init__(self,db_connect):
@@ -59,7 +76,8 @@ class ResaPdfStoragePipeline:
     def status(self):
         provider=os.getenv('DOCUMENT_STORAGE_PROVIDER','local').lower()
         try:store=storage_backend();return {'status':'READY','provider':store.provider,'bucket':store.bucket,'max_bytes':self.max_bytes}
-        except Exception as exc:return {'status':'NOT_CONFIGURED','provider':provider,'message':str(exc),'max_bytes':self.max_bytes}
+        except Exception:
+            return {'status':'NOT_CONFIGURED','provider':provider,'error_code':'STORAGE_NOT_CONFIGURED','max_bytes':self.max_bytes}
     def store_document(self,organization_id,document_id):
         with self.db_connect() as db:
             doc=db.execute('SELECT * FROM resa_documents WHERE organization_id=? AND id=?',(organization_id,document_id)).fetchone()
