@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import config
 from scoring import calculate
-from db_adapter import connect, BACKEND, IS_POSTGRES, ROOT
+from db_adapter import connect, BACKEND, IS_POSTGRES, ROOT, redact_error, tenant_context, set_tenant_context, clear_tenant_context
 
 ORG_ID = "org_demo_lux"
 
@@ -86,6 +86,8 @@ def init_db():
                 print('[db] Running PostgreSQL migrations...')
                 run_migrations()
                 print('[db] Migrations applied.')
+                connection_test()
+                print('[db] Runtime PostgreSQL role and RLS posture validated.')
                 if os.getenv('MIGRATE_SQLITE_DATA','false').lower() in ('1','true','yes'):
                     print('[db] Copying SQLite baseline into PostgreSQL...')
                     migrate_sqlite_data()
@@ -147,6 +149,16 @@ def init_db():
         for factor,weight in weights.items(): db.execute("INSERT OR IGNORE INTO scoring_weights VALUES(?,?,?,?,?)",('weight_'+factor,ORG_ID,factor,weight,ts))
         recalculate_all(db, ORG_ID)
 
+def insert_job(db, job_id, organization_id, job_type, status, started_at, finished_at=None, records_processed=0, error=None, payload=None, attempt=0, schedule=None):
+    """Insert a job with an explicit column list on SQLite and PostgreSQL."""
+    db.execute("""INSERT INTO jobs(
+        id,organization_id,job_type,status,started_at,finished_at,records_processed,
+        error,payload,attempt,schedule
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(
+        job_id,organization_id,job_type,status,started_at,finished_at,records_processed,
+        error,json.dumps(payload or {}),attempt,schedule
+    ))
+
 def rows(sql, params=()):
     with connect() as db: return [dict(x) for x in db.execute(sql,params).fetchall()]
 def one(sql, params=()):
@@ -207,5 +219,10 @@ def company_detail(org_id,cid):
         c["prospect"]=one("SELECT * FROM prospects WHERE organization_id=? AND company_id=?",(org_id,cid))
     return c
 
-def audit(org_id,action,etype,eid,metadata=None):
-    with connect() as db: db.execute("INSERT INTO audit_logs VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),org_id,"user_demo_owner",action,etype,eid,json.dumps(metadata or {}),now()))
+def audit(org_id,action,etype,eid,metadata=None,user_id=None):
+    _,context_user=tenant_context()
+    actor=user_id or context_user or ('user_development' if not os.getenv('NACELUX_ENV','development').lower() in ('production','prod') else None)
+    if not actor:
+        raise RuntimeError('Authenticated user context is required for production audit logging')
+    with connect() as db:
+        db.execute("INSERT INTO audit_logs VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),org_id,actor,action,etype,eid,json.dumps(metadata or {}),now()))

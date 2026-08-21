@@ -11,7 +11,7 @@ Processes asynchronous jobs and queues:
 """
 from __future__ import annotations
 import argparse, json, logging, os, signal, sys, time, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +19,9 @@ sys.path.insert(0, str(ROOT / 'backend'))
 
 import config
 import database as data
+if os.getenv('NACELUX_ENV','development').lower() in ('production','prod'):
+    import auth as _production_auth
+    _production_auth.validate_production_auth()
 from resa_connector import LBRResaConnector
 from document_storage import ResaPdfStoragePipeline
 from pdf_extraction import PdfTextExtractionEngine
@@ -35,6 +38,8 @@ logging.basicConfig(
 logger = logging.getLogger('nacelux.worker')
 
 RUNNING = True
+MAX_ATTEMPTS = max(1, int(os.getenv('WORKER_MAX_ATTEMPTS', '3')))
+RETRY_BACKOFF_SECONDS = max(0, int(os.getenv('WORKER_RETRY_BACKOFF_SECONDS', '5')))
 
 def handle_shutdown(signum, frame):
     global RUNNING
@@ -68,26 +73,30 @@ class Worker:
         claimed_jobs = []
 
         with self.connect() as db:
-            # First, recover any stuck jobs that crashed while RUNNING
-            self._reap_stuck_jobs(db)
-
-            # Query candidate QUEUED jobs
-            candidates = db.execute(
-                "SELECT id, organization_id, job_type, payload, attempt FROM jobs WHERE status = 'QUEUED' ORDER BY started_at ASC LIMIT ?",
-                (limit,)
-            ).fetchall()
-
-            for row in candidates:
-                job_id = row['id']
-                # Atomically transition from QUEUED to RUNNING to avoid race conditions between workers
-                res = db.execute(
-                    "UPDATE jobs SET status = 'RUNNING', started_at = ?, attempt = COALESCE(attempt, 0) + 1 WHERE id = ? AND status = 'QUEUED'",
-                    (now_iso, job_id)
-                )
-                # Check if this worker instance successfully claimed the job
-                claimed_count = getattr(res, 'rowcount', 1)
-                if claimed_count > 0:
-                    claimed_jobs.append(dict(row))
+            # PostgreSQL uses SECURITY DEFINER queue functions so the worker
+            # role does not own tenant tables or bypass RLS. SQLite keeps the
+            # equivalent conditional-update implementation for development.
+            if data.BACKEND == 'postgresql':
+                db.execute("SELECT app_reap_orphan_jobs(?,?)", (15, MAX_ATTEMPTS)).fetchone()
+                claimed_jobs = [dict(row) for row in db.execute(
+                    "SELECT job_id,organization_id,job_type,payload,attempt,context_user_id FROM app_claim_jobs(?)",
+                    (limit,)
+                ).fetchall()]
+            else:
+                self._reap_stuck_jobs(db)
+                ready_clause = "(schedule IS NULL OR (schedule = 'RETRY' AND started_at <= datetime('now')))"
+                candidates = db.execute(
+                    f"SELECT id, organization_id, job_type, payload, attempt FROM jobs WHERE status IN ('QUEUED','RETRY') AND {ready_clause} ORDER BY started_at ASC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+                for row in candidates:
+                    job_id = row['id']
+                    res = db.execute(
+                        "UPDATE jobs SET status = 'RUNNING', started_at = ?, attempt = COALESCE(attempt, 0) + 1, schedule = NULL WHERE id = ? AND status IN ('QUEUED','RETRY')",
+                        (now_iso, job_id)
+                    )
+                    if getattr(res, 'rowcount', 1) > 0:
+                        claimed_jobs.append(dict(row))
 
         for job in claimed_jobs:
             if not RUNNING:
@@ -98,23 +107,38 @@ class Worker:
                     payload = json.loads(job['payload']) if isinstance(job['payload'], str) else job['payload']
                 except Exception:
                     payload = {}
-            self.execute_job(job['id'], job['organization_id'], job['job_type'], payload)
+            self.execute_job(job['id'], job['organization_id'], job['job_type'], payload, job.get('context_user_id'))
             processed += 1
 
         return processed
 
     def _reap_stuck_jobs(self, db, timeout_minutes=15):
-        """Recover jobs that remained in RUNNING state past the timeout threshold (e.g. following worker process crash)."""
-        try:
-            # For SQLite/PostgreSQL compatibility, mark stuck running jobs as RETRY or FAILED if max attempts exceeded
-            db.execute(
-                "UPDATE jobs SET status = CASE WHEN COALESCE(attempt, 1) >= 3 THEN 'FAILED' ELSE 'QUEUED' END, error = 'Recovered from unexpected worker termination' WHERE status = 'RUNNING' AND started_at < datetime('now', '-' || ? || ' minutes')",
-                (timeout_minutes,)
-            )
-        except Exception:
-            pass
+        """Recover RUNNING jobs after a worker crash without hiding database errors."""
+        if data.BACKEND == 'postgresql':
+            cutoff = "CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')"
+        else:
+            cutoff = "datetime('now', '-' || ? || ' minutes')"
+        retry_at = utcnow() if data.BACKEND == 'postgresql' else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        db.execute(
+            f"""UPDATE jobs
+                SET status = CASE WHEN COALESCE(attempt, 1) >= ? THEN 'FAILED' ELSE 'RETRY' END,
+                    error = 'Recovered from unexpected worker termination',
+                    schedule = CASE WHEN COALESCE(attempt, 1) >= ? THEN NULL ELSE 'RETRY' END,
+                    started_at = CASE WHEN COALESCE(attempt, 1) >= ? THEN started_at ELSE ? END
+                WHERE status = 'RUNNING' AND started_at < {cutoff}""",
+            (MAX_ATTEMPTS, MAX_ATTEMPTS, MAX_ATTEMPTS, retry_at, timeout_minutes)
+        )
 
-    def execute_job(self, job_id: str, org_id: str, job_type: str, payload: dict) -> dict:
+    def execute_job(self, job_id: str, org_id: str, job_type: str, payload: dict, context_user_id: str | None = None) -> dict:
+        """Execute a job inside its PostgreSQL tenant context."""
+        previous = data.tenant_context()
+        data.set_tenant_context(org_id, context_user_id)
+        try:
+            return self._execute_job(job_id, org_id, job_type, payload)
+        finally:
+            data.set_tenant_context(*previous)
+
+    def _execute_job(self, job_id: str, org_id: str, job_type: str, payload: dict) -> dict:
         """Execute a single job and update its lifecycle status in the database."""
         started_at = utcnow()
         logger.info(f"Starting job {job_id} ({job_type}) for org {org_id}")
@@ -126,6 +150,7 @@ class Worker:
         error = None
         records_processed = 0
         result = {}
+        retryable = True
 
         try:
             if job_type == 'OPPORTUNITY_RECALCULATION':
@@ -233,18 +258,29 @@ class Worker:
 
             else:
                 status = 'FAILED'
+                retryable = False
                 error = f"Unsupported job type: {job_type}"
 
         except Exception as exc:
             status = 'FAILED'
-            error = str(exc)
-            logger.error(f"Error executing job {job_id}: {exc}", exc_info=True)
+            error = data.redact_error(exc)
+            logger.error(f"Error executing job {job_id}: {error}")
 
         finished_at = utcnow()
+        retry_schedule = None
+        retry_started_at = finished_at
         with self.connect() as db:
+            if status == 'FAILED' and retryable and error:
+                row = db.execute("SELECT attempt FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                attempt = int(row['attempt'] or 0) if row else MAX_ATTEMPTS
+                if attempt < MAX_ATTEMPTS:
+                    delay = RETRY_BACKOFF_SECONDS * (2 ** max(0, attempt - 1))
+                    retry_started_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).replace(microsecond=0).isoformat()
+                    retry_schedule = 'RETRY'
+                    status = 'RETRY'
             db.execute(
-                "UPDATE jobs SET status = ?, finished_at = ?, records_processed = ?, error = ? WHERE id = ?",
-                (status, finished_at, records_processed, error, job_id)
+                "UPDATE jobs SET status = ?, started_at = ?, finished_at = ?, records_processed = ?, error = ?, schedule = ? WHERE id = ?",
+                (status, retry_started_at, finished_at, records_processed, error, retry_schedule, job_id)
             )
 
         logger.info(f"Finished job {job_id} with status {status} ({records_processed} items)")
@@ -305,7 +341,7 @@ class Worker:
                 if processed > 0:
                     logger.info(f"Worker cycle processed {processed} item(s)")
             except Exception as exc:
-                logger.error(f"Error during worker cycle: {exc}", exc_info=True)
+                logger.error(f"Error during worker cycle: {data.redact_error(exc)}")
 
             # Sleep in 0.5s increments to respond promptly to shutdown signals
             slept = 0.0
@@ -327,13 +363,16 @@ def main():
 
     if args.job:
         with data.connect() as db:
-            row = db.execute("SELECT id, organization_id, job_type, payload FROM jobs WHERE id = ?", (args.job,)).fetchone()
+            row = db.execute("""SELECT j.id,j.organization_id,j.job_type,j.payload,
+                (SELECT om.user_id FROM organization_members om WHERE om.organization_id=j.organization_id
+                 ORDER BY CASE om.role WHEN 'OWNER' THEN 1 WHEN 'ADMIN' THEN 2 ELSE 3 END LIMIT 1) context_user_id
+                FROM jobs j WHERE j.id = ?""", (args.job,)).fetchone()
             if not row:
                 logger.error(f"Job {args.job} not found")
                 sys.exit(1)
             job = dict(row)
             payload = json.loads(job['payload']) if isinstance(job.get('payload'), str) else (job.get('payload') or {})
-            res = worker.execute_job(job['id'], job['organization_id'], job['job_type'], payload)
+            res = worker.execute_job(job['id'], job['organization_id'], job['job_type'], payload, job.get('context_user_id'))
             print(json.dumps(res, indent=2))
             sys.exit(0 if res.get('status') == 'SUCCESS' else 1)
 

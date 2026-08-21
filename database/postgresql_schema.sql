@@ -42,6 +42,6 @@ CREATE TABLE jobs(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),organization_id 
 CREATE TABLE data_lineage(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),organization_id uuid NOT NULL REFERENCES organizations,entity_type text NOT NULL,entity_id uuid NOT NULL,field_name text NOT NULL,source_id uuid REFERENCES data_sources,source_url text,document_id uuid REFERENCES documents,retrieved_at timestamptz NOT NULL,confidence numeric(4,3),method certainty NOT NULL);
 CREATE TABLE audit_logs(id bigserial PRIMARY KEY,organization_id uuid NOT NULL REFERENCES organizations,user_id uuid REFERENCES users,action text NOT NULL,entity_type text,entity_id uuid,metadata jsonb NOT NULL DEFAULT '{}',created_at timestamptz NOT NULL DEFAULT now());
 
--- Apply the same policy to every organization-owned table in deployment migrations.
-ALTER TABLE companies ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_companies ON companies USING (organization_id = current_setting('app.organization_id',true)::uuid) WITH CHECK (organization_id = current_setting('app.organization_id',true)::uuid);
+-- RLS is installed by the additive deployment migrations 0011 and 0013.
+-- Do not use a policy that trusts app.organization_id by itself: production
+-- policies must validate the authenticated membership and force RLS.

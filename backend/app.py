@@ -29,7 +29,11 @@ PDF_EXTRACTION=PdfTextExtractionEngine(data.connect)
 ROOT=Path(__file__).resolve().parents[1]
 FRONTEND=ROOT/"frontend"
 PORT=int(os.environ.get("PORT","8000"))
+_PRODUCTION=os.environ.get('NACELUX_ENV','development').lower() in ('production','prod')
 AUTH_ACTIVE=auth.AUTH_ENABLED and data.IS_POSTGRES
+
+if _PRODUCTION and not AUTH_ACTIVE:
+    raise RuntimeError('Production authentication and PostgreSQL are mandatory; refusing Demo/SQLite runtime')
 
 def flatten(qs): return {k:v[-1] for k,v in parse_qs(qs).items() if v}
 
@@ -40,14 +44,26 @@ class API(BaseHTTPRequestHandler):
     def auth_context(self):
         if hasattr(self,'_auth_context'): return self._auth_context
         if not AUTH_ACTIVE:
-            self._auth_context={'user_id':'user_demo_owner','display_name':'Demo Owner','organization_id':data.ORG_ID,'organization_name':'NACELUX Demo Workspace','role':'OWNER','demo':True}
+            if _PRODUCTION:
+                raise auth.AuthError('Production authentication is not configured',503,'AUTH_NOT_CONFIGURED')
+            self._auth_context={'user_id':'user_demo_owner','display_name':'Development User','organization_id':data.ORG_ID,'organization_name':'Development Workspace','role':'OWNER','demo':True}
             return self._auth_context
         session=auth.get_session(self.headers.get('Cookie'))
         if not session: raise auth.AuthError('Authentication required',401,'AUTH_REQUIRED')
+        # Seed only the authenticated identity while provisioning/looking up the
+        # workspace; the organization context is set only from that membership.
+        data.set_tenant_context(None,session['auth_user'].get('id'))
         self._auth_context=auth.ensure_workspace(session['auth_user'],data.connect)
+        data.set_tenant_context(self._auth_context['organization_id'],self._auth_context['user_id'])
         self._auth_context['csrf']=session.get('csrf')
         self._refreshed_session=session.get('refreshed')
         return self._auth_context
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            data.clear_tenant_context()
     @property
     def org(self): return self.auth_context['organization_id']
     def json(self,payload,status=200,headers=None):
@@ -78,12 +94,13 @@ class API(BaseHTTPRequestHandler):
                         db.execute("SELECT 1").fetchone()
                 except Exception as exc:
                     db_healthy = False
-                    db_err = str(exc)
+                    db_err = exc
+                    print(f"[health] code=DATABASE_UNAVAILABLE detail={data.redact_error(exc)}", file=sys.stderr)
 
                 db_status = {"status": "CONNECTED", "provider": "supabase-postgresql"} if data.IS_POSTGRES else {"status": "LOCAL_FALLBACK", "provider": "sqlite"}
                 if not db_healthy:
                     db_status["status"] = "UNAVAILABLE"
-                    db_status["error"] = db_err
+                    db_status["code"] = "DATABASE_UNAVAILABLE"
 
                 overall_status = "HEALTHY" if db_healthy else "UNHEALTHY"
                 http_code = 200 if db_healthy else 503
@@ -141,7 +158,7 @@ class API(BaseHTTPRequestHandler):
             return self.static(path)
         except auth.AuthError as e: return self.json({"error":str(e),"code":e.code},e.status)
         except Exception as e:
-            print("ERROR",repr(e)); return self.json({"error":"Internal error","status":"ERROR"},500)
+            print(f"[http] ERROR detail={data.redact_error(e)}", file=sys.stderr); return self.json({"error":"Internal error","status":"ERROR"},500)
     def do_POST(self):
         path=urlparse(self.path).path; body=self.body()
         if path.startswith('/api/v1/auth/'):
@@ -207,41 +224,41 @@ class API(BaseHTTPRequestHandler):
             if typ not in allowed:return self.json({"error":"Unsupported job type"},400)
             if typ=='BUSINESS_SIGNAL_REFRESH':
                 signal_result=BUSINESS_SIGNALS.refresh(self.org,body.get('company_id'));jid="job_"+str(uuid.uuid4())[:8];ok=signal_result.get('status')=='SUCCESS';status='SUCCESS' if ok else 'FAILED';err=signal_result.get('message')
-                with data.connect() as db:data.recalculate_all(db,self.org);db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),signal_result.get('companies_processed',0),err))
+                with data.connect() as db:data.recalculate_all(db,self.org);data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),signal_result.get('companies_processed',0),err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'signal_run_id':signal_result.get('run_id')});return self.json({'id':jid,'status':status,'result':signal_result},201)
             if typ=='PEOPLE_INTELLIGENCE':
                 company_id=str(body.get('company_id','')).strip()
                 if not company_id:return self.json({'error':'company_id is required'},400)
                 people_result=PEOPLE_ENGINE.analyze(self.org,company_id);BUSINESS_SIGNALS.detect(self.org,company_id);jid="job_"+str(uuid.uuid4())[:8];ok=people_result.get('status')=='SUCCESS';status='SUCCESS' if ok else 'FAILED';err=people_result.get('message')
-                with data.connect() as db:data.recalculate_all(db,self.org);db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),people_result.get('official_people_found',0),err))
+                with data.connect() as db:data.recalculate_all(db,self.org);data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),people_result.get('official_people_found',0),err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'company_id':company_id});return self.json({'id':jid,'status':status,'result':people_result},201)
             if typ=='SEO_AUDIT':
                 company_id=str(body.get('company_id','')).strip()
                 if not company_id:return self.json({'error':'company_id is required'},400)
                 seo_result=SEO_AUDIT.audit(self.org,company_id);jid="job_"+str(uuid.uuid4())[:8];ok=seo_result.get('status') in ('SUCCESS','NOT_APPLICABLE');status='SUCCESS' if ok else 'FAILED';err=seo_result.get('message')
-                with data.connect() as db:data.recalculate_all(db,self.org);db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),1 if ok else 0,err))
+                with data.connect() as db:data.recalculate_all(db,self.org);data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),1 if ok else 0,err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'company_id':company_id});return self.json({'id':jid,'status':status,'result':seo_result},201)
             if typ in ('WEBSITE_DISCOVERY','DIGITAL_FOOTPRINT_CHECK'):
                 company_id=str(body.get('company_id','')).strip()
                 if not company_id:return self.json({'error':'company_id is required'},400)
                 intelligence=WEBSITE_DISCOVERY.discover(self.org,company_id) if typ=='WEBSITE_DISCOVERY' else DIGITAL_FOOTPRINT.analyze(self.org,company_id);jid="job_"+str(uuid.uuid4())[:8];ok=intelligence.get('status') in ('FOUND','NOT_FOUND','NOT_CONFIGURED','SUCCESS');status='SUCCESS' if ok else 'FAILED';err=intelligence.get('message')
-                with data.connect() as db:data.recalculate_all(db,self.org);db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),1 if ok else 0,err))
+                with data.connect() as db:data.recalculate_all(db,self.org);data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),1 if ok else 0,err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'company_id':company_id});return self.json({'id':jid,'status':status,'result':intelligence},201)
             if typ=='NACE_SYNC':
                 nace_result=NACE_IMPORTER.import_official();jid="job_"+str(uuid.uuid4())[:8];status='SUCCESS' if nace_result.get('status')=='SUCCESS' else 'FAILED';err=nace_result.get('message')
-                with data.connect() as db:db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),nace_result.get('classes',0),err))
+                with data.connect() as db:data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),nace_result.get('classes',0),err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'nace_run_id':nace_result.get('run_id')});return self.json({'id':jid,'status':status,'result':nace_result},201)
             if typ in ('PDF_EXTRACTION','OCR_PROCESSING'):
                 document_id=str(body.get('document_id','')).strip()
                 if not document_id:return self.json({'error':'document_id is required'},400)
                 extract_result=PDF_EXTRACTION.extract_document(self.org,document_id,force_ocr=(typ=='OCR_PROCESSING'));jid="job_"+str(uuid.uuid4())[:8];status='SUCCESS' if extract_result.get('status') in ('SUCCESS','PARTIAL','ALREADY_EXTRACTED') else 'FAILED';err=extract_result.get('message')
-                with data.connect() as db:db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),extract_result.get('extracted_pages',0),err))
+                with data.connect() as db:data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),extract_result.get('extracted_pages',0),err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'document_id':document_id,'extraction_id':extract_result.get('extraction_id')});return self.json({'id':jid,'status':status,'result':extract_result},201)
             if typ=='DOCUMENT_DOWNLOAD':
                 document_id=str(body.get('document_id','')).strip()
                 if not document_id:return self.json({'error':'document_id is required for DOCUMENT_DOWNLOAD'},400)
                 storage_result=PDF_STORAGE.store_document(self.org,document_id);jid="job_"+str(uuid.uuid4())[:8];status='SUCCESS' if storage_result.get('status') in ('STORED','DUPLICATE','ALREADY_STORED') else 'FAILED';err=storage_result.get('message')
-                with data.connect() as db:db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),1 if status=='SUCCESS' else 0,err))
+                with data.connect() as db:data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),1 if status=='SUCCESS' else 0,err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'document_id':document_id});return self.json({'id':jid,'status':status,'result':storage_result},201)
             if typ=='RESA_SYNC':
                 source_url=str(body.get('source_url','')).strip()
@@ -249,12 +266,12 @@ class API(BaseHTTPRequestHandler):
                 try:sync_result=RESA_CONNECTOR.analyze(self.org,source_url,allow_browser=body.get('allow_browser',True))
                 except ValueError as exc:return self.json({'error':str(exc)},400)
                 jid="job_"+str(uuid.uuid4())[:8];status='SUCCESS' if sync_result.get('status')=='SUCCESS' else 'FAILED';err=sync_result.get('message')
-                with data.connect() as db:db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),sync_result.get('rows_detected',0),err))
+                with data.connect() as db:data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),sync_result.get('rows_detected',0),err)
                 data.audit(self.org,'RUN_JOB','job',jid,{'type':typ,'resa_run_id':sync_result.get('run_id')});return self.json({'id':jid,'status':status,'result':sync_result},201)
             jid="job_"+str(uuid.uuid4())[:8]; status="SUCCESS" if typ=="OPPORTUNITY_RECALCULATION" else "FAILED"; err=None if status=="SUCCESS" else "Connector NOT_CONNECTED — no data was fabricated"
             with data.connect() as db:
                 if typ=="OPPORTUNITY_RECALCULATION": data.recalculate_all(db,self.org)
-                db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)",(jid,self.org,typ,status,data.now(),data.now(),0,err))
+                data.insert_job(db,jid,self.org,typ,status,data.now(),data.now(),0,err)
             data.audit(self.org,"RUN_JOB","job",jid,{"type":typ,"status":status}); return self.json({"id":jid,"status":status,"error":err},201)
         if path=="/api/v1/organization/members/role":
             ctx=self.auth_context
@@ -299,11 +316,18 @@ class API(BaseHTTPRequestHandler):
                 result=auth.signup(email,password,name)
                 session=result.get('session') or (result if result.get('access_token') else None)
                 headers=[('Set-Cookie',v) for v in auth.cookie_headers(session)] if session else []
-                if session: auth.ensure_workspace(result.get('user') or auth.user(session['access_token']),data.connect)
+                if session:
+                    auth_user=result.get('user') or auth.user(session['access_token'])
+                    data.set_tenant_context(None,auth_user.get('id'))
+                    workspace=auth.ensure_workspace(auth_user,data.connect)
+                    data.set_tenant_context(workspace['organization_id'],workspace['user_id'])
                 return self.json({'status':'SIGNED_UP','confirmation_required':not bool(session),'message':'Check your email to confirm your account.' if not session else 'Account created.'},201,headers)
             if path.endswith('/login'):
                 session=auth.login(str(body.get('email','')).strip().lower(),str(body.get('password','')))
-                ctx=auth.ensure_workspace(session.get('user') or auth.user(session['access_token']),data.connect)
+                auth_user=session.get('user') or auth.user(session['access_token'])
+                data.set_tenant_context(None,auth_user.get('id'))
+                ctx=auth.ensure_workspace(auth_user,data.connect)
+                data.set_tenant_context(ctx['organization_id'],ctx['user_id'])
                 headers=[('Set-Cookie',v) for v in auth.cookie_headers(session)]
                 return self.json({'status':'AUTHENTICATED','user':{'name':ctx['display_name'],'role':ctx['role']},'organization':{'id':ctx['organization_id'],'name':ctx['organization_name']}},200,headers)
             if path.endswith('/recover'):
@@ -312,7 +336,10 @@ class API(BaseHTTPRequestHandler):
                 auth.recover(email);return self.json({'status':'EMAIL_SENT','message':'If this account exists, a reset email has been sent.'})
             if path.endswith('/adopt-session'):
                 access=str(body.get('access_token',''));refresh_token=str(body.get('refresh_token',''))
-                verified=auth.user(access);ctx=auth.ensure_workspace(verified,data.connect)
+                verified=auth.user(access)
+                data.set_tenant_context(None,verified.get('id'))
+                ctx=auth.ensure_workspace(verified,data.connect)
+                data.set_tenant_context(ctx['organization_id'],ctx['user_id'])
                 session={'access_token':access,'refresh_token':refresh_token,'expires_in':int(body.get('expires_in',3600))}
                 return self.json({'status':'AUTHENTICATED'},200,[('Set-Cookie',v) for v in auth.cookie_headers(session)])
             if path.endswith('/update-password'):
@@ -339,7 +366,7 @@ class API(BaseHTTPRequestHandler):
             out={}
             for x in items: out[x.get(field) or "Unknown"]=out.get(x.get(field) or "Unknown",0)+1
             return [{"label":k,"value":v} for k,v in sorted(out.items(),key=lambda z:-z[1])]
-        return self.json({"today":today,"top":items[:10],"analytics":{"category":group("category"),"municipality":group("municipality"),"level":group("opportunity_level"),"nace":group("primary_nace_code")},"demo":True})
+        return self.json({"today":today,"top":items[:10],"analytics":{"category":group("category"),"municipality":group("municipality"),"level":group("opportunity_level"),"nace":group("primary_nace_code")},"demo":bool(self.auth_context.get('demo'))})
     def filters(self):
         fields=["canton","municipality","primary_nace_code","category","niche","website_status"]
         result={}

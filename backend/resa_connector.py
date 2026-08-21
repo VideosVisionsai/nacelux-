@@ -5,7 +5,7 @@ Playwright is used only when the public page requires JavaScript. Captchas are
 reported and never bypassed.
 """
 from __future__ import annotations
-import hashlib, json, os, re, time, urllib.parse, urllib.request, urllib.robotparser, uuid
+import hashlib, json, os, re, time, urllib.error, urllib.parse, urllib.request, urllib.robotparser, uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -114,10 +114,15 @@ class LBRResaConnector:
         self.db_connect=db_connect;self.enabled=(os.getenv('LBR_RESA_ENABLED','false').lower() in ('1','true','yes')) if enabled is None else enabled
         self.user_agent=os.getenv('LBR_USER_AGENT','NACELUX/1.0 (controlled RESA reader)');self.timeout_ms=int(os.getenv('LBR_RESA_TIMEOUT_MS','45000'))
         self.min_interval=float(os.getenv('LBR_RESA_MIN_INTERVAL_SECONDS','8'));self.artifacts=Path(os.getenv('LBR_RESA_ARTIFACT_DIR',config.ROOT/'data'/'resa-artifacts'))
+        self.artifact_provider=os.getenv('DOCUMENT_STORAGE_PROVIDER','supabase' if os.getenv('NACELUX_ENV','development').lower() in ('production','prod') else 'local').lower()
+        self.storage_base=os.getenv('SUPABASE_URL','').rstrip('/')
+        self.storage_key=os.getenv('SUPABASE_SERVICE_ROLE_KEY','')
+        self.storage_bucket=os.getenv('SUPABASE_STORAGE_BUCKET','resa-documents')
     def status(self):
         try:import playwright.sync_api;browser='AVAILABLE'
         except ImportError:browser='NOT_INSTALLED'
-        return {'key':'lbr_resa','name':'LBR / RESA','status':'READY' if self.enabled else 'DISABLED','base_url':LBR_ORIGIN,'browser':browser,'policy':'Public pages only; no undocumented API; captcha is never bypassed.'}
+        artifact_status='SUPABASE_STORAGE' if self.artifact_provider=='supabase' else 'LOCAL_DEVELOPMENT_ONLY'
+        return {'key':'lbr_resa','name':'LBR / RESA','status':'READY' if self.enabled else 'DISABLED','base_url':LBR_ORIGIN,'browser':browser,'artifact_storage':artifact_status,'policy':'Public pages only; no undocumented API; captcha is never bypassed.'}
     def analyze(self,organization_id,url,allow_browser=True,headless=None):
         validate_url(url)
         if not self.enabled:return {'status':'DISABLED','error_code':'CONNECTOR_DISABLED','message':'Set LBR_RESA_ENABLED=true after compliance approval.'}
@@ -131,12 +136,12 @@ class LBRResaConnector:
             if allow_browser and (not page.entries or page.captcha_status=='REQUIRED'):
                 page=self._browser_fetch(url,robots,headless)
             if page.captcha_status=='REQUIRED' and not page.entries:
-                self._save_artifact(run_id,page)
+                self._save_artifact(run_id,page,organization_id)
                 return self._fail(run_id,'CAPTCHA_REQUIRED','LBR requested interactive captcha resolution; no bypass was attempted.',robots,page.fetch_method,'REQUIRED',page)
             if not page.entries:
-                self._save_artifact(run_id,page)
+                self._save_artifact(run_id,page,organization_id)
                 return self._fail(run_id,'STRUCTURE_NOT_DETECTED','The public page rendered no recognizable publication rows; nothing was stored as a successful journal analysis.',robots,page.fetch_method,page.captcha_status,page)
-            result=self._store(organization_id,run_id,page);self._save_artifact(run_id,page);return result
+            result=self._store(organization_id,run_id,page);self._save_artifact(run_id,page,organization_id);return result
         except Exception as exc:
             code='PLAYWRIGHT_UNAVAILABLE' if 'playwright' in str(exc).lower() else 'FETCH_ERROR'
             return self._fail(run_id,code,str(exc),robots)
@@ -200,5 +205,23 @@ class LBRResaConnector:
         url=canonical_url(document.url);existing=db.execute("SELECT id FROM resa_documents WHERE organization_id=? AND canonical_url=?",(org,url)).fetchone()
         if existing:db.execute("UPDATE resa_documents SET last_seen_at=?,entry_id=COALESCE(entry_id,?) WHERE id=?",(now,entry,existing['id']));return 0
         did='resa_doc_'+sha(org+'|'+url)[:24];db.execute("INSERT INTO resa_documents(id,organization_id,journal_id,entry_id,document_url,canonical_url,document_type,link_text,source_url,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(did,org,journal,entry,url,url,document.document_type,document.link_text,source,now,now));return 1
-    def _save_artifact(self,rid,page):
-        self.artifacts.mkdir(parents=True,exist_ok=True);(self.artifacts/f'{rid}.html').write_text(page.html,encoding='utf-8');summary={'url':page.source_url,'method':page.fetch_method,'captcha':page.captcha_status,'rows':len(page.entries),'documents':len(page.documents)+sum(len(e.documents) for e in page.entries),'snapshot_hash':sha(page.html)};(self.artifacts/f'{rid}.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+    def _save_artifact(self,rid,page,organization_id=None):
+        summary={'url':page.source_url,'method':page.fetch_method,'captcha':page.captcha_status,'rows':len(page.entries),'documents':len(page.documents)+sum(len(e.documents) for e in page.entries),'snapshot_hash':sha(page.html)}
+        files=((f'{rid}.html',page.html.encode('utf-8'),'text/html; charset=utf-8'),(f'{rid}.json',json.dumps(summary,indent=2).encode('utf-8'),'application/json'))
+        if os.getenv('NACELUX_ENV','development').lower() in ('production','prod'):
+            if self.artifact_provider!='supabase' or not self.storage_base or not self.storage_key or not self.storage_bucket:
+                raise RuntimeError('Supabase Storage is required for RESA artifacts in production')
+            prefix=f"{organization_id or 'system'}/resa-artifacts"
+            for filename,body,mime in files:
+                object_key=f'{prefix}/{filename}'
+                url=f"{self.storage_base}/storage/v1/object/{urllib.parse.quote(self.storage_bucket,safe='')}/{urllib.parse.quote(object_key,safe='/')}"
+                request=urllib.request.Request(url,data=body,method='POST',headers={'Authorization':'Bearer '+self.storage_key,'apikey':self.storage_key,'Content-Type':mime,'x-upsert':'true'})
+                try:
+                    with urllib.request.urlopen(request,timeout=30) as response:
+                        if response.status not in (200,201): raise RuntimeError(f'Artifact storage returned HTTP {response.status}')
+                except urllib.error.HTTPError as exc:
+                    raise RuntimeError(f'Artifact storage failed with HTTP {exc.code}') from exc
+            return
+        self.artifacts.mkdir(parents=True,exist_ok=True)
+        (self.artifacts/files[0][0]).write_bytes(files[0][1])
+        (self.artifacts/files[1][0]).write_bytes(files[1][1])
