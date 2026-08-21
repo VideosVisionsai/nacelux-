@@ -158,6 +158,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             'NACELUX_ENV': 'production',
             'DB_PROVIDER': 'postgresql',
             'DATABASE_URL': TEST_URL,
+            'DB_RUNTIME_ROLE': 'nacelux_worker',
             'AUTO_MIGRATE': 'false',
             'WORKER_MAX_ATTEMPTS': '3',
         }

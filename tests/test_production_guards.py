@@ -45,7 +45,7 @@ class ProductionGuardTests(unittest.TestCase):
             cwd=ROOT,
             env={**os.environ, 'NACELUX_ENV': 'production', 'DB_PROVIDER': 'postgresql',
                  'DATABASE_URL': 'postgresql://runtime:secret@db.example.test:5432/postgres?sslmode=require',
-                 'DB_SSLMODE': 'require'},
+                 'DB_SSLMODE': 'require', 'DB_RUNTIME_ROLE': 'nacelux_runtime'},
             capture_output=True, text=True, timeout=10,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -58,7 +58,7 @@ class ProductionGuardTests(unittest.TestCase):
             cwd=ROOT,
             env={**os.environ, 'NACELUX_ENV': 'production', 'DB_PROVIDER': 'postgresql',
                  'DATABASE_URL': 'postgresql://runtime:secret@db.example.test:5432/postgres?sslmode=require',
-                 'DB_SSLMODE': 'require'},
+                 'DB_SSLMODE': 'require', 'DB_RUNTIME_ROLE': 'nacelux_runtime'},
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -85,7 +85,7 @@ finally:
 '''
         env = {**os.environ, 'NACELUX_ENV': 'production', 'DB_PROVIDER': 'postgresql',
                'DATABASE_URL': 'postgresql://runtime:secret@db.example.test:5432/postgres?sslmode=require',
-               'DB_SSLMODE': 'require',
+               'DB_SSLMODE': 'require', 'DB_RUNTIME_ROLE': 'nacelux_runtime',
                'SUPABASE_URL': 'https://project.supabase.co', 'SUPABASE_ANON_KEY': 'anon-live-key',
                'AUTH_COOKIE_SECURE': 'true', 'AUTH_REDIRECT_URL': 'https://app.nacelux.test',
                'DOCUMENT_STORAGE_PROVIDER': 'supabase', 'SUPABASE_SERVICE_ROLE_KEY': 'service-live-key',
@@ -115,6 +115,7 @@ finally:
         self.assertNotIn('super-secret', value)
         self.assertNotIn('eyJheader.payload.signature', value)
         self.assertNotIn('Bearer eyJheader.payload.signature', value)
+        self.assertNotIn('supabase.co', redact_error('credential=supabase.co'))
 
 
 if __name__ == '__main__':

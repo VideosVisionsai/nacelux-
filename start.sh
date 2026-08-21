@@ -22,6 +22,14 @@ if [ "${ENVIRONMENT}" = "production" ] || [ "${ENVIRONMENT}" = "prod" ]; then
         echo "ERROR: MIGRATION_DATABASE_URL is mandatory for privileged migrations in production."
         exit 1
     fi
+    if [ "${MIGRATION_DATABASE_URL}" = "${DATABASE_URL}" ]; then
+        echo "ERROR: MIGRATION_DATABASE_URL must be separate from the non-owner runtime DATABASE_URL."
+        exit 1
+    fi
+    if [ -z "${DB_RUNTIME_ROLE:-}" ]; then
+        echo "ERROR: DB_RUNTIME_ROLE is mandatory for RLS runtime validation."
+        exit 1
+    fi
     if [ "${DB_SSLMODE:-}" != "require" ]; then
         echo "ERROR: DB_SSLMODE=require is mandatory in production."
         exit 1

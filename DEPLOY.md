@@ -40,6 +40,7 @@ Dans Railway, va dans l'onglet **Variables** du service et ajoute :
 ```env
 DATABASE_URL=postgresql://postgres.VOTRE_REF:PASSWORD@aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require
 DB_PROVIDER=postgresql
+DB_RUNTIME_ROLE=nacelux_runtime
 DB_SSLMODE=require
 MIGRATION_DATABASE_URL=postgresql://postgres.VOTRE_REF:PASSWORD@aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require
 SUPABASE_URL=https://VOTRE_REF.supabase.co
@@ -74,7 +75,9 @@ Dans le même projet Railway :
 1. **Database** :
    - Récupère l'URI de connexion dans **Project Settings → Database → Connection string (Session pooler)**.
    - Assure-toi que `AUTO_MIGRATE=true` est activé : au démarrage, `start.sh` applique automatiquement les migrations additives `0001` à `0014` sans intervention manuelle.
-   - Le rôle runtime web/worker ne doit pas être propriétaire des tables tenant et ne doit pas avoir `BYPASSRLS`. Accorde uniquement `EXECUTE` sur `app_claim_jobs` et `app_reap_orphan_jobs` au rôle worker dédié.
+   - Crée deux rôles non propriétaires avant migration : `nacelux_runtime` pour le web et `nacelux_worker` pour le worker. Aucun ne doit avoir `BYPASSRLS` ou `SUPERUSER`.
+   - Configure `DATABASE_URL` avec le rôle runtime et `DB_RUNTIME_ROLE` avec le nom exact du rôle. Configure le worker avec son propre `DATABASE_URL` et `DB_RUNTIME_ROLE=nacelux_worker`.
+   - `MIGRATION_DATABASE_URL` reste réservé aux migrations privilégiées et doit être différent de `DATABASE_URL`. Les migrations vérifient les rôles et accordent les privilèges tenant sous RLS.
 2. **Authentication** :
    - Dans **Authentication → URL Configuration**, ajoute l'URL de ton application Railway dans **Site URL** et **Redirect URLs**.
 3. **Storage** :

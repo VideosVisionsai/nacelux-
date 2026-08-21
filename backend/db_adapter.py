@@ -51,6 +51,8 @@ def validate_production_database_config() -> None:
     validate_database_url(DATABASE_URL, require_ssl=True)
     if os.getenv('DB_SSLMODE','') != 'require':
         raise ProductionConfigurationError('DB_SSLMODE=require is required in NACELUX_ENV=production')
+    if not os.getenv('DB_RUNTIME_ROLE','').strip():
+        raise ProductionConfigurationError('DB_RUNTIME_ROLE is required for PostgreSQL RLS runtime in production')
 
 
 # Import-time validation prevents app.py, worker.py or scripts from silently
@@ -151,10 +153,15 @@ def connect():
         connection=PgConnection(psycopg.connect(DATABASE_URL,**options))
         if _PRODUCTION:
             role=connection.execute("SELECT rolname,rolbypassrls,rolsuper FROM pg_roles WHERE rolname=current_user").fetchone()
+            expected_role=os.getenv('DB_RUNTIME_ROLE','').strip()
             if not role or role['rolbypassrls'] or role['rolsuper']:
                 connection._conn.rollback()
                 connection._conn.close()
                 raise ProductionConfigurationError('Runtime PostgreSQL role must not bypass RLS or be superuser')
+            if expected_role and role['rolname'] != expected_role:
+                connection._conn.rollback()
+                connection._conn.close()
+                raise ProductionConfigurationError('Connected PostgreSQL role does not match DB_RUNTIME_ROLE')
         return connection
     if _PRODUCTION:
         # Defensive belt-and-suspenders guard: this branch must be unreachable.
@@ -171,7 +178,7 @@ def redact_error(value: object) -> str:
     """Return a safe diagnostic string without passwords, tokens or URLs."""
     text = str(value)
     text = re.sub(r"(?i)(postgres(?:ql)?://[^:]+:)[^@\s]+@", r"\1<redacted>@", text)
-    text = re.sub(r"(?i)((?:password|secret|token|key|authorization)[\s:=]+)[^\s,;]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)((?:password|secret|token|key|authorization|credential)[\s:=]+)[^\s,;]+", r"\1<redacted>", text)
     text = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", '<jwt-redacted>', text)
     text = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~-]+", 'Bearer <redacted>', text)
     return text[:500]

@@ -63,5 +63,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
 
--- Deployment must grant EXECUTE on these two functions to the dedicated
--- worker role. The role must not own tenant tables and must not have BYPASSRLS.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='nacelux_worker') THEN
+        RAISE EXCEPTION 'Create the non-owner nacelux_worker role before applying production migrations';
+    END IF;
+    EXECUTE 'REVOKE ALL ON FUNCTION app_claim_jobs(integer) FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON FUNCTION app_reap_orphan_jobs(integer,integer) FROM PUBLIC';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION app_claim_jobs(integer) TO nacelux_worker';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION app_reap_orphan_jobs(integer,integer) TO nacelux_worker';
+    EXECUTE 'GRANT USAGE ON SCHEMA public TO nacelux_worker';
+    EXECUTE 'GRANT SELECT,INSERT,UPDATE,DELETE ON organizations,users,organization_members TO nacelux_worker';
+    EXECUTE 'GRANT SELECT,INSERT,UPDATE,DELETE ON companies,business_signals,opportunity_scores,prospects,data_sources,jobs,data_lineage,audit_logs,taxonomy_nodes,people,digital_checks,seo_audits,reports,territories,scoring_weights TO nacelux_worker';
+    EXECUTE 'GRANT SELECT,INSERT,UPDATE,DELETE ON resa_journals,resa_entries,resa_documents,resa_sync_runs,storage_objects,document_extractions,document_page_extractions TO nacelux_worker';
+END $$;

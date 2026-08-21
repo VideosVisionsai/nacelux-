@@ -70,7 +70,7 @@ class HealthApiTests(unittest.TestCase):
         original_connect = database.connect
         original_backend = database.IS_POSTGRES
         def broken_connect():
-            raise RuntimeError('postgresql://runtime:super-secret@db.example.test:5432/postgres?sslmode=require')
+            raise RuntimeError('postgresql://runtime:super-secret@db.example.test:5432/postgres?sslmode=require password=secret token=jwt credential=supabase.co')
         database.connect = broken_connect
         database.IS_POSTGRES = True
         try:
@@ -78,8 +78,8 @@ class HealthApiTests(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 urlopen(req, timeout=5)
             response = caught.exception.read().decode() if hasattr(caught.exception, 'read') else str(caught.exception)
-            self.assertNotIn('super-secret', response)
-            self.assertNotIn('postgresql://', response)
+            for forbidden in ('postgresql://','supabase.co','password','secret','token','credential'):
+                self.assertNotIn(forbidden, response.lower())
             self.assertIn('DATABASE_UNAVAILABLE', response)
         finally:
             database.connect = original_connect
