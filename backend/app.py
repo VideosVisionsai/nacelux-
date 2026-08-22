@@ -132,7 +132,36 @@ class API(BaseHTTPRequestHandler):
                 return self.json({"items":items,"pagination":{"total":total,"limit":limit,"offset":offset,"page":offset//limit+1,"pages":(total+limit-1)//limit}})
             if path.startswith("/api/v1/companies/"): 
                 item=data.company_detail(self.org,path.rsplit("/",1)[-1]); return self.json(item if item else {"error":"Not found"},200 if item else 404)
-            if path=="/api/v1/opportunities": return self.json({"items":data.list_companies(self.org,q)})
+            if path=="/api/v1/opportunities":
+                limit=min(max(int(q.get("limit",25) or 25),1),100); offset=max(int(q.get("offset",0) or 0),0)
+                where=["o.organization_id=?"]; params=[self.org]
+                if q.get("search"): where.append("(c.company_name LIKE ? OR c.rcs_number LIKE ?)"); t=f"%{q['search']}%"; params += [t,t]
+                if q.get("level"): where.append("o.level=?"); params.append(q["level"].upper().replace("_"," "))
+                if q.get("score_min"): where.append("o.score>=?"); params.append(int(q["score_min"]))
+                if q.get("score_max"): where.append("o.score<=?"); params.append(int(q["score_max"]))
+                if q.get("municipality"): where.append("c.municipality=?"); params.append(q["municipality"])
+                sort=q.get("sort","highest_score")
+                order={"highest_score":"o.score DESC,c.company_name","lowest_score":"o.score ASC,c.company_name","newest":"c.created_at DESC","recently_updated":"o.calculated_at DESC"}.get(sort,"o.score DESC,c.company_name")
+                clause=" AND ".join(where)
+                total=data.one(f"SELECT count(*) count FROM opportunity_scores o JOIN companies c ON c.id=o.company_id AND c.organization_id=o.organization_id WHERE {clause}",params)['count']
+                items=data.rows(f"""SELECT c.id company_id,c.company_name,c.legal_form,c.rcs_number,c.creation_date,c.municipality,c.website_status,
+                    o.score,o.level,o.recommended_action,o.model_version,o.fingerprint,o.calculated_at,o.breakdown,o.factor_snapshot,
+                    (SELECT count(*) FROM business_signals s WHERE s.organization_id=o.organization_id AND s.company_id=o.company_id AND s.status='ACTIVE') accepted_signals,
+                    (SELECT count(*) FROM business_signals s WHERE s.organization_id=o.organization_id AND s.company_id=o.company_id AND s.status!='ACTIVE') rejected_signals
+                    FROM opportunity_scores o JOIN companies c ON c.id=o.company_id AND c.organization_id=o.organization_id
+                    WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?""",params+[limit,offset])
+                return self.json({"items":items,"pagination":{"total":total,"limit":limit,"offset":offset,"page":offset//limit+1,"pages":(total+limit-1)//limit}})
+            if path.startswith("/api/v1/opportunities/"):
+                cid=path.rsplit("/",1)[-1]
+                detail=data.company_detail(self.org,cid)
+                if not detail: return self.json({"error":"Not found"},404)
+                # accepted/rejected signals
+                accepted=data.rows("SELECT signal_type,severity,confidence,explanation,data_quality,last_seen_at FROM business_signals WHERE organization_id=? AND company_id=? AND status='ACTIVE'",(self.org,cid))
+                rejected=data.rows("SELECT signal_type,severity,confidence,explanation,data_quality,last_seen_at,status FROM business_signals WHERE organization_id=? AND company_id=? AND status!='ACTIVE'",(self.org,cid))
+                history=data.rows("SELECT model_version,total_score,level,recommended_action,fingerprint,created_at FROM opportunity_score_history WHERE organization_id=? AND company_id=? ORDER BY created_at DESC LIMIT 20",(self.org,cid))
+                # validation status
+                validation=data.one("SELECT validation_status,validated_by,validated_at,validation_comment FROM companies WHERE organization_id=? AND id=?",(self.org,cid))
+                return self.json({"company":detail,"accepted_signals":accepted,"rejected_signals":rejected,"score_history":history,"validation":{"status":(validation["validation_status"] if validation else "REVIEW_PENDING"),"reviewer":(validation["validated_by"] if validation else None),"reviewed_at":(validation["validated_at"] if validation else None),"comment":(validation["validation_comment"] if validation else None)}})
             if path=="/api/v1/prospects": return self.json({"items":data.rows("""SELECT p.*,c.company_name,c.municipality,o.score FROM prospects p JOIN companies c ON c.id=p.company_id AND c.organization_id=p.organization_id JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE p.organization_id=? ORDER BY p.updated_at DESC""",(self.org,))})
             if path=="/api/v1/sources": return self.json({"items":data.rows("SELECT * FROM data_sources WHERE organization_id=? ORDER BY name",(self.org,)),"jobs":data.rows("SELECT * FROM jobs WHERE organization_id=? ORDER BY started_at DESC LIMIT 20",(self.org,))})
             if path=="/api/v1/imports": return self.json({"items":data.rows("SELECT id,source_id,import_type,status,records_received,records_valid,records_created,records_updated,records_skipped,records_failed,started_at,finished_at FROM imports WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
@@ -367,6 +396,17 @@ class API(BaseHTTPRequestHandler):
             source=body.get('source') or {}
             # Dry run only: the pipeline reads existing data but writes nothing.
             return self.json(pipeline.preview(self.org,source,rows))
+        if path=="/api/v1/opportunities/validate":
+            company_id=str(body.get('company_id','')).strip(); decision=str(body.get('decision','')).upper().strip(); comment=str(body.get('comment',''))[:2000]
+            if decision not in ('APPROVED','REJECTED','DISMISSED','REVIEW_PENDING'):return self.json({'error':'decision must be APPROVED, REJECTED, DISMISSED, or REVIEW_PENDING'},400)
+            company=data.one("SELECT id,validation_status FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            prev=company['validation_status'] or 'REVIEW_PENDING'; ctx=self.auth_context; ts=data.now()
+            with data.connect() as db:
+                db.execute("UPDATE companies SET validation_status=?,validated_by=?,validated_at=?,validation_comment=?,updated_at=? WHERE organization_id=? AND id=?",(decision,ctx['user_id'],ts,comment,ts,self.org,company_id))
+                db.execute("INSERT INTO opportunity_validations(id,organization_id,company_id,previous_status,new_status,reviewer,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",("ov_"+str(uuid.uuid4())[:24],self.org,company_id,prev,decision,ctx['user_id'],comment,ts))
+            data.audit(self.org,'VALIDATE_OPPORTUNITY','company',company_id,{'previous':prev,'new':decision,'comment':comment})
+            return self.json({'status':'SUCCESS','validation_status':decision,'previous_status':prev})
         if path=="/api/v1/import":
             rows=body.get('rows',[])
             if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or limit exceeded"},400)

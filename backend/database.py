@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS ai_extractions(id TEXT PRIMARY KEY,organization_id TE
 CREATE INDEX IF NOT EXISTS idx_ai_tenant ON ai_extractions(organization_id,created_at);
 CREATE TABLE IF NOT EXISTS opportunity_score_history(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),model_version TEXT NOT NULL,total_score INTEGER NOT NULL,level TEXT NOT NULL,recommended_action TEXT,factor_snapshot TEXT DEFAULT '{}',input_snapshot TEXT DEFAULT '{}',fingerprint TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_osh_tenant ON opportunity_score_history(organization_id,company_id,created_at);
+CREATE TABLE IF NOT EXISTS opportunity_validations(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),previous_status TEXT NOT NULL,new_status TEXT NOT NULL,reviewer TEXT,comment TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_ov_tenant ON opportunity_validations(organization_id,company_id,created_at);
 """
 
 DEMO_COMPANIES = [
@@ -151,6 +153,9 @@ def init_db():
         opp_existing={r['name'] for r in db.execute("PRAGMA table_info(opportunity_scores)")}
         for name,kind in {'model_version':'TEXT','factor_snapshot':'TEXT','input_snapshot':'TEXT','fingerprint':'TEXT'}.items():
             if name not in opp_existing:db.execute(f'ALTER TABLE opportunity_scores ADD COLUMN {name} {kind}')
+        comp_existing={r['name'] for r in db.execute("PRAGMA table_info(companies)")}
+        for name,kind in {'validation_status':"TEXT DEFAULT 'REVIEW_PENDING'",'validated_by':'TEXT','validated_at':'TEXT','validation_comment':'TEXT'}.items():
+            if name not in comp_existing:db.execute(f'ALTER TABLE companies ADD COLUMN {name} {kind}')
         ts=now(); db.execute("INSERT OR IGNORE INTO organizations VALUES(?,?,?,?)",(ORG_ID,"NACELUX Demo Workspace","nacelux-demo",ts))
         db.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)",("user_demo_owner","demo@nacelux.local","Demo Owner",ts))
         db.execute("INSERT OR IGNORE INTO organization_members VALUES(?,?,?)",(ORG_ID,"user_demo_owner","OWNER"))
