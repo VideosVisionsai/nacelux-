@@ -46,6 +46,37 @@ _ROLE_KW = r"g[ée]rant|administrateur|directeur|pr[ée]sident|associ[ée]e?|man
 _NAME_WORD = r"[A-ZÉÀ-Ý][a-zà-ÿ]+(?:-[A-ZÉÀ-Ý][a-zà-ÿ]+)?"
 _ROLE_RE = re.compile("(" + _ROLE_KW + r")\s*:?\s+(" + _NAME_WORD + r"(?:\s+(?!(" + _ROLE_KW + r")\b)" + _NAME_WORD + r"){0,3})", re.I)
 
+# Legal-entity indicators that disqualify a candidate from being a natural person.
+# If any of these appear in the excerpt near a candidate name, it is a legal entity.
+_LEGAL_ENTITY_RE = re.compile(
+    r"(?:RCS\s*B\s*\d|B\s*\d{5,}|société|S\.?\s*à\s*r\.?|SARL|Sàrl|SCSP|SCA|GmbH|"
+    r"société en commandite|ayant son siège|société à responsabilité limitée|"
+    r"société anonyme|holding|capital\s+variable|SE\s*S\.?C\.?A\.?)", re.I)
+
+# French legal phrases that look like names but are NOT persons.
+_LEGAL_PHRASES = {"solidairement responsable", "indéfiniment responsable",
+                  "responsable indéfiniment", "non associé", "non partenaire",
+                  "responsable solidairement"}
+
+
+def _is_natural_person(name: str, excerpt: str) -> bool:
+    """Return True ONLY if the candidate is plausibly a natural person (not a
+    legal entity or legal phrase). Never infers a person — only rejects obvious
+    non-persons. A legal-entity manager (e.g. a Sàrl named as 'gérant') must NOT
+    be treated as a natural-person decision maker."""
+    if not name or len(name) < 3:
+        return False
+    # Legal phrase check (e.g. "solidairement responsable")
+    if name.lower().strip() in _LEGAL_PHRASES:
+        return False
+    # Name must start with uppercase (re.I in the regex allows lowercase; enforce here)
+    if not name[0].isupper():
+        return False
+    # Legal-entity indicators in the surrounding excerpt (RCS number, legal form, etc.)
+    if _LEGAL_ENTITY_RE.search(excerpt):
+        return False
+    return True
+
 
 def ensure_source(db, org_id: str) -> None:
     """Register RESA as a data_source. Status is REQUIRES_CONFIRMATION until a
@@ -76,16 +107,20 @@ def extract_company_facts(text: str) -> dict:
 
 
 def extract_people_facts(text: str) -> list[dict]:
-    """Extract ONLY explicitly labelled directors/roles. Returns [] when none are
-    labelled -- never invents a person or role."""
+    """Extract ONLY explicitly labelled directors/roles who are NATURAL PERSONS.
+    Legal entities (companies named as gérant, legal phrases) are rejected.
+    Returns [] when none are labelled -- never invents a person or role."""
     text = text or ""
     out: list[dict] = []
     for match in _ROLE_RE.finditer(text):
         role = re.sub(r"\s+", " ", match.group(1)).strip().lower()
         name = re.sub(r"\s+", " ", match.group(2)).strip()
-        if name and len(name) >= 3:
-            out.append({"display_name": name, "official_role": role, "excerpt": match.group(0).strip()})
-    # de-duplicate identical (name, role)
+        excerpt = match.group(0).strip()
+        ctx_start = max(0, match.start() - 30)
+        ctx_end = min(len(text), match.end() + 200)
+        context = text[ctx_start:ctx_end]
+        if name and len(name) >= 3 and _is_natural_person(name, context):
+            out.append({"display_name": name, "official_role": role, "excerpt": excerpt})
     seen = set(); unique = []
     for p in out:
         key = (p["display_name"], p["official_role"])
