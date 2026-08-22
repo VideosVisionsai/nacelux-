@@ -168,6 +168,19 @@ class API(BaseHTTPRequestHandler):
             if path.startswith("/api/v1/resa/provenance/"):
                 cid=path.rsplit("/",1)[-1]; chain=resapipe.provenance(self.org,cid)
                 return self.json(chain if chain else {"error":"Not found"},200 if chain else 404)
+            if path=="/api/v1/resa/documents":
+                limit=min(max(int(q.get("limit",50) or 50),1),200); offset=max(int(q.get("offset",0) or 0),0)
+                return self.json({"items":data.rows("SELECT id,document_url,canonical_url,document_type,download_status,extraction_status,link_text,storage_provider,storage_key,size_bytes,first_seen_at,last_seen_at FROM resa_documents WHERE organization_id=? ORDER BY last_seen_at DESC LIMIT ? OFFSET ?",(self.org,limit,offset))})
+            if path.startswith("/api/v1/resa/documents/") and path.endswith("/pages"):
+                did=path.split("/")[-2]
+                return self.json({"document_id":did,"pages":data.rows("SELECT p.page_number,p.extraction_method,p.text_content,p.char_count,p.confidence,p.quality_score FROM document_page_extractions p JOIN document_extractions e ON e.id=p.extraction_id AND e.organization_id=p.organization_id WHERE p.organization_id=? AND p.document_id=? ORDER BY p.page_number",(self.org,did))})
+            if path.startswith("/api/v1/resa/documents/") and path.endswith("/evidence"):
+                did=path.split("/")[-2]
+                return self.json({"document_id":did,"people":data.rows("SELECT id,display_name,job_title,official_role,source_type,match_status,confidence,review_status,reviewer,reviewed_at,review_comment,source_page,evidence_excerpt FROM people WHERE organization_id=? AND source_extraction_id IN (SELECT id FROM document_extractions WHERE organization_id=? AND document_id=?)",(self.org,self.org,did))})
+            if path.startswith("/api/v1/resa/documents/"):
+                did=path.rsplit("/",1)[-1]; doc=data.one("SELECT * FROM resa_documents WHERE organization_id=? AND id=?",(self.org,did))
+                if not doc: return self.json({"error":"Not found"},404)
+                return self.json({"document":doc,"extractions":data.rows("SELECT id,status,extraction_method,page_count,extracted_pages,ocr_pages,char_count,quality_score,ocr_language,engine_version,started_at,completed_at,error_code,error_message FROM document_extractions WHERE organization_id=? AND document_id=? ORDER BY started_at DESC",(self.org,did))})
             if path=="/api/v1/reports": return self.json({"items":data.rows("SELECT * FROM reports WHERE organization_id=? ORDER BY created_at DESC",(self.org,))})
             if path=="/api/v1/logs": return self.json({"items":data.rows("SELECT * FROM audit_logs WHERE organization_id=? ORDER BY created_at DESC LIMIT 100",(self.org,))})
             if path=="/api/v1/organization/members": return self.json({"items":data.rows("SELECT u.id,u.email,u.display_name,m.role FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.organization_id=? ORDER BY CASE m.role WHEN 'OWNER' THEN 1 WHEN 'ADMIN' THEN 2 ELSE 3 END,u.display_name",(self.org,))})
@@ -247,6 +260,23 @@ class API(BaseHTTPRequestHandler):
             document_id=path.split('/')[-2];result=PDF_EXTRACTION.extract_document(self.org,document_id,bool(body.get('force_ocr',False)))
             data.audit(self.org,'EXTRACT_RESA_PDF','resa_document',document_id,{'status':result.get('status'),'method':result.get('method'),'extraction_id':result.get('extraction_id')})
             return self.json(result,200 if result.get('status') in ('SUCCESS','PARTIAL','ALREADY_EXTRACTED') else 422)
+        if path.startswith('/api/v1/resa/documents/') and path.endswith('/people'):
+            document_id=path.split('/')[-2]
+            ext=data.one("SELECT id FROM document_extractions WHERE organization_id=? AND document_id=? AND status IN ('SUCCESS','PARTIAL') ORDER BY started_at DESC LIMIT 1",(self.org,document_id))
+            if not ext:return self.json({'error':'No successful extraction for this document'},404)
+            result=PDF_EXTRACTION.extract_people(self.org,ext['id'])
+            data.audit(self.org,'EXTRACT_PEOPLE_PDF','resa_document',document_id,{'people_found':result.get('people_found')})
+            return self.json(result,200)
+        if path.startswith('/api/v1/resa/documents/') and path.endswith('/review'):
+            document_id=path.split('/')[-2]
+            person_id=str(body.get('person_id','')).strip();decision=str(body.get('decision','')).upper();comment=str(body.get('comment',''))[:1000]
+            if decision not in ('APPROVED','REJECTED'):return self.json({'error':'decision must be APPROVED or REJECTED'},400)
+            person=data.one("SELECT id,official_role,review_status FROM people WHERE organization_id=? AND id=?",(self.org,person_id))
+            if not person:return self.json({'error':'Person not found'},404)
+            ctx=self.auth_context
+            with data.connect() as db:db.execute("UPDATE people SET review_status=?,reviewer=?,reviewed_at=?,review_comment=? WHERE organization_id=? AND id=?",(decision,ctx['user_id'],data.now(),comment,self.org,person_id))
+            data.audit(self.org,'REVIEW_PERSON','person',person_id,{'decision':decision,'previous':person['review_status'],'document':document_id,'comment':comment})
+            return self.json({'status':'SUCCESS','review_status':decision})
         if path=="/api/v1/resa/analyze":
             source_url=str(body.get('source_url','')).strip()
             try:result=RESA_CONNECTOR.analyze(self.org,source_url,allow_browser=body.get('allow_browser',True))

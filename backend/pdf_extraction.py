@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import config
 
-ENGINE_VERSION='nacelux-pdf-extractor-1'
+ENGINE_VERSION='nacelux-pdf-extractor-2'  # PyMuPDF native + OCRmyPDF fallback
 def now():return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 def normalize_text(value):return re.sub(r'[ \t]+',' ',re.sub(r'\r\n?', '\n',value or '')).strip()
 def text_quality(text,min_chars=80):
@@ -13,16 +13,82 @@ def text_quality(text,min_chars=80):
     printable=sum(1 for c in text if c.isprintable() or c in '\n\t')/len(text);alnum=sum(1 for c in text if c.isalnum())/len(text);volume=min(1,len(text)/max(min_chars,1))
     return round(.5*printable+.3*min(1,alnum/.45)+.2*volume,4)
 
+PDF_MAGIC=b'%PDF-'
+
+def validate_pdf_bytes(data, *, max_bytes=None):
+    """Validate a PDF buffer: magic bytes + optional size limit. Raises ValueError
+    on anything that is not a PDF or exceeds the limit. Pure function (no I/O)."""
+    if not isinstance(data,(bytes,bytearray)):
+        raise ValueError('PDF data must be bytes')
+    if max_bytes is not None and len(data)>max_bytes:
+        raise ValueError(f'PDF exceeds maximum size ({len(data)} > {max_bytes})')
+    if len(data)<5 or bytes(data[:5])!=PDF_MAGIC:
+        raise ValueError('Not a PDF (missing %PDF- magic bytes)')
+    return True
+
+def has_pymupdf():
+    try:
+        import pymupdf  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def has_ocrmypdf():
+    """OCRmyPDF needs the ocrmypdf binary plus tesseract + ghostscript."""
+    return bool(shutil.which('ocrmypdf')) and bool(shutil.which('tesseract')) and bool(shutil.which('gs'))
+
+def native_pages_pymupdf(path, *, max_pages=None):
+    """Extract native embedded text per page with PyMuPDF. Raises RuntimeError if
+    PyMuPDF is unavailable, the PDF is encrypted, or it exceeds max_pages. Native
+    text is NEVER silently replaced -- OCR is a separate, opt-in fallback."""
+    import pymupdf
+    doc=pymupdf.open(path)
+    try:
+        if doc.is_encrypted:
+            raise RuntimeError('PDF is encrypted')
+        if max_pages is not None and doc.page_count>max_pages:
+            raise RuntimeError(f'PDF has {doc.page_count} pages; configured maximum is {max_pages}')
+        return [{'page_number':i+1,'text':doc[i].get_text('text') or ''} for i in range(doc.page_count)]
+    finally:
+        doc.close()
+
+def run_ocrmypdf(in_path, out_path, *, languages='fra+deu+eng', timeout=180):
+    """Run OCRmyPDF over a whole scanned PDF to add a text layer. 100% open source
+    (Tesseract + Ghostscript). Raises RuntimeError if not installed; never simulated."""
+    if not has_ocrmypdf():
+        raise RuntimeError('OCRmyPDF/Tesseract/Ghostscript not installed (REQUIRES_CONFIGURATION)')
+    cmd=['ocrmypdf','-l',languages,'--skip-text','--quiet',in_path,out_path]
+    proc=subprocess.run(cmd,capture_output=True,text=True,timeout=timeout)
+    if proc.returncode!=0 or not Path(out_path).is_file():
+        raise RuntimeError(f'OCRmyPDF failed: {(proc.stderr or "").strip()[:500]}')
+    return out_path
+
+def extract_people_from_pages(pages):
+    """Extract ONLY explicitly labelled directors/roles from extracted page text.
+    Returns [{display_name, official_role, page, excerpt}]. Reuses the RESA pipeline
+    explicit-label extractor (never deduces a role). [] when none are labelled."""
+    import resa_pipeline as _rp
+    out=[]
+    for page in pages or []:
+        for p in _rp.extract_people_facts(page.get('text') or ''):
+            out.append({**p,'page':page.get('page_number')})
+    return out
+
 class PdfTextExtractionEngine:
     def __init__(self,db_connect):
         self.db_connect=db_connect;self.max_pages=int(os.getenv('PDF_EXTRACTION_MAX_PAGES','100'));self.min_chars=int(os.getenv('PDF_TEXT_MIN_CHARS_PER_PAGE','80'));self.min_quality=float(os.getenv('PDF_TEXT_MIN_QUALITY','.55'));self.ocr_enabled=os.getenv('PDF_OCR_ENABLED','true').lower() in ('1','true','yes');self.languages=os.getenv('PDF_OCR_LANGUAGES','fra+deu+eng');self.dpi=int(os.getenv('PDF_OCR_DPI','300'));self.ocr_timeout=int(os.getenv('PDF_OCR_TIMEOUT_SECONDS','90'))
     def status(self):
-        try:import pypdf;native='AVAILABLE'
-        except ImportError:native='NOT_INSTALLED'
-        try:import pypdfium2;renderer='AVAILABLE'
-        except ImportError:renderer='NOT_INSTALLED'
-        tesseract=shutil.which('tesseract')
-        return {'status':'READY' if native=='AVAILABLE' else 'NOT_CONFIGURED','native_text':native,'ocr_renderer':renderer,'tesseract':'AVAILABLE' if tesseract else 'NOT_INSTALLED','ocr_enabled':self.ocr_enabled,'languages':self.languages,'max_pages':self.max_pages}
+        pymupdf='AVAILABLE' if has_pymupdf() else 'NOT_INSTALLED'
+        try:
+            import pypdf  # noqa: F401
+            pypdf='AVAILABLE'
+        except Exception:
+            pypdf='NOT_INSTALLED'
+        ocrmypdf='AVAILABLE' if has_ocrmypdf() else 'NOT_INSTALLED'
+        tesseract='AVAILABLE' if shutil.which('tesseract') else 'NOT_INSTALLED'
+        ready = pymupdf=='AVAILABLE' or pypdf=='AVAILABLE'
+        return {'status':'READY' if ready else 'NOT_CONFIGURED','native_text':pymupdf,'pypdf':pypdf,'ocrmypdf':ocrmypdf,'tesseract':tesseract,'ocr_enabled':self.ocr_enabled,
+                'ocr_status':'REQUIRES_CONFIGURATION' if ocrmypdf!='AVAILABLE' else 'READY','languages':self.languages,'max_pages':self.max_pages,'engine_version':ENGINE_VERSION}
     def extract_document(self,organization_id,document_id,force_ocr=False):
         with self.db_connect() as db:
             row=db.execute("SELECT d.*,s.provider,s.bucket,s.object_key,s.local_reference,s.checksum_sha256 FROM resa_documents d LEFT JOIN storage_objects s ON s.id=d.storage_object_id AND s.organization_id=d.organization_id WHERE d.organization_id=? AND d.id=?",(organization_id,document_id)).fetchone()
@@ -68,6 +134,43 @@ class PdfTextExtractionEngine:
             return {'status':'FAILED','extraction_id':extraction_id,'error_code':'EXTRACTION_FAILED','message':str(exc)}
         finally:
             if path and getattr(self,'_temporary',False):Path(path).unlink(missing_ok=True)
+    def extract_people(self, organization_id, extraction_id):
+        """Extract ONLY explicitly labelled people/roles from an extraction's page
+        text and persist them as PENDING_REVIEW observations (source_type
+        PDF_EXTRACTION). They are never presented as verified deciders before a
+        human review. Idempotent (deterministic person id per extraction+name)."""
+        with self.db_connect() as db:
+            ext = db.execute("SELECT document_id FROM document_extractions WHERE organization_id=? AND id=?", (organization_id, extraction_id)).fetchone()
+            if not ext:
+                return {'status': 'NOT_FOUND', 'error_code': 'EXTRACTION_NOT_FOUND'}
+            rows = db.execute("SELECT page_number, text_content FROM document_page_extractions WHERE organization_id=? AND extraction_id=? ORDER BY page_number", (organization_id, extraction_id)).fetchall()
+            source_url = db.execute("SELECT source_url FROM resa_documents WHERE organization_id=? AND id=?", (organization_id, ext['document_id'])).fetchone()
+        source_url = source_url['source_url'] if source_url else None
+        people = extract_people_from_pages([{'page_number': r['page_number'], 'text': r['text_content'] or ''} for r in rows])
+        created = []
+        with self.db_connect() as db:
+            for p in people:
+                norm = normalize_text(p['display_name']).lower()
+                pid = 'person_pdf_' + hashlib.sha256((organization_id + '|' + extraction_id + '|' + norm).encode()).hexdigest()[:22]
+                db.execute(
+                    "INSERT INTO people(id, organization_id, display_name, job_title, source_type, match_status, confidence, "
+                    "is_demo, created_at, name_normalized, official_role, source_url, source_extraction_id, checked_at, "
+                    "privacy_status, review_status, source_page, evidence_excerpt) "
+                    "VALUES(?,?,?,?, 'PDF_EXTRACTION', 'PENDING', 1.0, 0, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'PENDING_REVIEW', ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET official_role=excluded.official_role, job_title=excluded.job_title, "
+                    "source_extraction_id=excluded.source_extraction_id, source_page=excluded.source_page, "
+                    "evidence_excerpt=excluded.evidence_excerpt",
+                    (pid, organization_id, p['display_name'], p['official_role'], now(), norm, p['official_role'],
+                     source_url, extraction_id, now(), p.get('page'), p.get('excerpt')))
+                eid = 'pev_pdf_' + hashlib.sha256((pid + '|PDF_ROLE|' + (source_url or extraction_id)).encode()).hexdigest()[:22]
+                db.execute(
+                    "INSERT INTO people_evidence(id, organization_id, person_id, evidence_type, source_url, source_extraction_id, "
+                    "excerpt, confidence, method, created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(person_id, evidence_type, source_url) "
+                    "DO UPDATE SET excerpt=excluded.excerpt, confidence=1.0, method='PDF_EXTRACTION'",
+                    (eid, organization_id, pid, 'PDF_ROLE', source_url, extraction_id, p.get('excerpt'), 1.0, 'PDF_EXTRACTION', now()))
+                created.append({'person_id': pid, 'display_name': p['display_name'], 'official_role': p['official_role'], 'page': p.get('page')})
+        return {'status': 'SUCCESS', 'extraction_id': extraction_id, 'people_found': len(created), 'people': created}
+
     def _materialize(self,doc):
         self._temporary=False
         if doc['provider']=='local':
@@ -84,11 +187,19 @@ class PdfTextExtractionEngine:
         else:raise RuntimeError(f"Unsupported storage provider: {doc['provider']}")
         digest=hashlib.sha256(path.read_bytes()).hexdigest()
         if digest!=doc['checksum_sha256']:raise RuntimeError('Stored PDF checksum does not match database metadata')
+        validate_pdf_bytes(path.read_bytes(), max_bytes=int(os.getenv('LBR_PDF_MAX_BYTES','52428800')))
         return str(path)
     def _native_pages(self,path):
-        try:from pypdf import PdfReader
-        except ImportError as exc:raise RuntimeError('pypdf is not installed') from exc
-        reader=PdfReader(path,strict=False);return [{'page_number':i+1,'text':page.extract_text() or ''} for i,page in enumerate(reader.pages)]
+        if has_pymupdf():
+            return native_pages_pymupdf(path, max_pages=self.max_pages)
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise RuntimeError('No native PDF text backend (install pymupdf or pypdf)') from exc
+        reader=PdfReader(path,strict=False)
+        pages=[{'page_number':i+1,'text':page.extract_text() or ''} for i,page in enumerate(reader.pages)]
+        if len(pages)>self.max_pages:raise RuntimeError(f'PDF has {len(pages)} pages; configured maximum is {self.max_pages}')
+        return pages
     def _ocr_page(self,path,page_number):
         if not shutil.which('tesseract'):raise RuntimeError('Tesseract OCR is not installed')
         try:import pypdfium2 as pdfium

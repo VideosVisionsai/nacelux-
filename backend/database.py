@@ -131,7 +131,7 @@ def init_db():
         for name,kind in {'payload':"TEXT DEFAULT '{}'",'attempt':'INTEGER DEFAULT 0','schedule':'TEXT'}.items():
             if name not in jobs_existing:db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         people_existing={r['name'] for r in db.execute("PRAGMA table_info(people)")}
-        for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT'}.items():
+        for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT','review_status':'TEXT','reviewer':'TEXT','reviewed_at':'TEXT','review_comment':'TEXT','source_page':'INTEGER','evidence_excerpt':'TEXT'}.items():
             if name not in people_existing:db.execute(f'ALTER TABLE people ADD COLUMN {name} {kind}')
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_people_company_name ON people(organization_id,company_id,name_normalized) WHERE name_normalized IS NOT NULL")
         # ÉTAPE 3 data-import core: additive columns mirrored from migration 0016.
