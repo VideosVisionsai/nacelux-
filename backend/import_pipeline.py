@@ -167,16 +167,28 @@ _COMPANY_COLS = (
 
 
 def persist_raw_record(db, org_id: str, source: dict | None, record: dict) -> str:
-    raw_id = "raw_" + uuid.uuid4().hex[:16]
     external_id = _norm(record.get("external_id"))
     content = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
     payload = json.dumps({k: record.get(k) for k in ("external_id", "source_url")}, ensure_ascii=False)
+    checksum = sha256_text(content)
+    # Idempotent: reuse an existing raw_record for the same (org, source, external_id, checksum).
+    if external_id is None:
+        existing = db.execute(
+            "SELECT id FROM raw_records WHERE organization_id=? AND source_id IS ? "
+            "AND external_id IS NULL AND checksum=?", (org_id, (source or {}).get("source_id"), checksum)).fetchone()
+    else:
+        existing = db.execute(
+            "SELECT id FROM raw_records WHERE organization_id=? AND source_id=? "
+            "AND external_id=? AND checksum=?", (org_id, (source or {}).get("source_id"), external_id, checksum)).fetchone()
+    if existing:
+        return existing["id"]
+    raw_id = "raw_" + uuid.uuid4().hex[:16]
     db.execute(
         "INSERT INTO raw_records(id, organization_id, source_id, external_id, payload, "
         "checksum, retrieved_at, stage, source_url, raw_content, content_format, status, metadata) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (raw_id, org_id, (source or {}).get("source_id"),
-         external_id, payload, sha256_text(content), _now(), "RAW",
+         external_id, payload, checksum, _now(), "RAW",
          (source or {}).get("source_url") or record.get("source_url"),
          content, "json", "INGESTED", "{}"))
     return raw_id
