@@ -2,7 +2,7 @@
 No search-result pages or protected social profiles are scraped.
 """
 from __future__ import annotations
-import hashlib, html, ipaddress, json, os, re, socket, unicodedata, urllib.error, urllib.parse, urllib.request, uuid
+import hashlib, html, ipaddress, json, os, re, socket, time, unicodedata, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -15,13 +15,57 @@ def company_tokens(name):
     return {x for x in norm(name).split() if len(x)>2 and x not in stop}
 def canonical(url):
     p=urllib.parse.urlsplit(url if '://' in url else 'https://'+url);path=p.path or '/';return urllib.parse.urlunsplit((p.scheme.lower(),(p.hostname or '').lower(),path.rstrip('/') or '/','',''))
+WEBSITE_STATUSES=('NOT_CHECKED','UNKNOWN','CHECKING','CONNECTED','NOT_FOUND','INVALID','BLOCKED','ERROR')
+WEBSITE_RULE_VERSION='2.1.0'
+NACELUX_UA=os.getenv('WEBSITE_USER_AGENT','NACELUX/1.0 (+https://nacelux.eu; website-verification)')
+# Cloud metadata / link-local endpoints that must never be fetched.
+METADATA_HOSTS=('169.254.169.254','metadata.google.internal','metadata','169.254.170.2')
+
+def _is_public_routable(ip):
+    """A destination is allowed only if it is a globally routable, non-special
+    address. This single positive check covers private, loopback, link-local,
+    reserved, multicast, unspecified, and all other non-global ranges."""
+    return ip.is_global and not (ip.is_private or ip.is_loopback or ip.is_link_local
+                                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
 def validate_public_url(url):
-    p=urllib.parse.urlsplit(url)
-    if p.scheme not in ('http','https') or not p.hostname or p.username or p.password or p.port not in (None,80,443):raise ValueError('Unsafe website URL')
-    addresses=socket.getaddrinfo(p.hostname,p.port or (443 if p.scheme=='https' else 80),type=socket.SOCK_STREAM)
+    """Strict SSRF guard. Parses the URL, allows only http/https on standard
+    ports with no credentials, refuses metadata hosts, resolves DNS and rejects
+    ANY resolved address that is not globally routable. All IPs are checked so a
+    hostname that resolves to one public + one private address is still refused."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        raise ValueError('Malformed URL')
+    if p.scheme not in ('http', 'https'):
+        raise ValueError('Only http/https schemes are allowed')
+    if not p.hostname:
+        raise ValueError('URL has no hostname')
+    if p.username or p.password:
+        raise ValueError('Credentials in URL are not allowed')
+    if p.port not in (None, 80, 443):
+        raise ValueError('Only ports 80 and 443 are allowed')
+    host = p.hostname.lower()
+    if host in METADATA_HOSTS:
+        raise ValueError('Metadata endpoint is blocked')
+    try:
+        literal = ipaddress.ip_address(host)
+        if not _is_public_routable(literal):
+            raise ValueError('URL host is not a public address')
+    except ValueError:
+        if host == 'localhost':
+            raise ValueError('localhost is blocked')
+    port = p.port or (443 if p.scheme == 'https' else 80)
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise ValueError('DNS resolution failed')
+    if not addresses:
+        raise ValueError('DNS resolution returned no address')
     for address in addresses:
-        ip=ipaddress.ip_address(address[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:raise ValueError('Website resolves to a non-public address')
+        ip = ipaddress.ip_address(address[4][0])
+        if not _is_public_routable(ip):
+            raise ValueError('URL resolves to a non-public address')
     return url
 
 class SafeWebsiteRedirect(urllib.request.HTTPRedirectHandler):
@@ -35,6 +79,50 @@ class PageText(HTMLParser):
     def handle_data(self,data):
         self.parts.append(data)
         if self.in_title:self.title.append(data)
+
+class WebsiteHTMLAnalyzer(HTMLParser):
+    """Passive extraction of on-page technical elements for the digital footprint.
+    No scripts/styles execute; this only parses received HTML."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title=[]; self._in_title=False
+        self._h1_parts=None; self.h1s=[]
+        self.meta_description=None; self.viewport=None; self.canonical=None; self.robots=None
+    def handle_starttag(self, tag, attrs):
+        t=tag.lower(); d=dict(attrs)
+        if t=='title': self._in_title=True
+        elif t=='h1': self._h1_parts=[]
+        elif t=='meta':
+            name=(d.get('name') or d.get('property') or '').lower(); content=d.get('content')
+            if content:
+                if name=='description': self.meta_description=content
+                elif name=='viewport': self.viewport=content
+                elif name=='robots': self.robots=content
+        elif t=='link' and (d.get('rel') or '').lower()=='canonical' and d.get('href'):
+            self.canonical=d['href']
+    def handle_endtag(self, tag):
+        t=tag.lower()
+        if t=='title': self._in_title=False
+        elif t=='h1' and self._h1_parts is not None:
+            txt=' '.join(self._h1_parts).strip()
+            if txt: self.h1s.append(txt)
+            self._h1_parts=None
+    def handle_data(self, data):
+        if self._in_title: self.title.append(data)
+        elif self._h1_parts is not None: self._h1_parts.append(data)
+
+def parse_html(html_text):
+    a=WebsiteHTMLAnalyzer()
+    try:
+        a.feed(html_text or ''); a.close()
+    except Exception:
+        pass
+    title=' '.join(a.title).strip() or None
+    h1=a.h1s[0] if a.h1s else None
+    return {'title':title,'title_length':len(title or ''),'h1':h1,'h1_count':len(a.h1s),
+            'meta_description':a.meta_description,'meta_length':len(a.meta_description or ''),
+            'viewport':a.viewport,'has_viewport':bool(a.viewport),
+            'canonical':a.canonical,'robots_meta':a.robots}
 
 class SearchProvider:
     name='none'
@@ -107,6 +195,107 @@ class WebsiteDiscoveryEngine:
             raw=response.read(self.max_bytes+1)
             if len(raw)>self.max_bytes:raise ValueError('Candidate page exceeds limit')
             parser=PageText();parser.feed(raw.decode(response.headers.get_content_charset() or 'utf-8','replace'));return {'title':' '.join(parser.title).strip(),'text':re.sub(r'\s+',' ',' '.join(parser.parts)).strip()[:200000]}
+    def analyze_website(self, url):
+        """Fetch a candidate URL (full SSRF guard, redirect revalidation, bounded
+        size, timeout) and return the technical on-page analysis. Raises on any
+        safety/validation/connectivity problem so the caller maps a status."""
+        validate_public_url(url)
+        start = time.monotonic()
+        opener = urllib.request.build_opener(SafeWebsiteRedirect())
+        req = urllib.request.Request(url, headers={'User-Agent': NACELUX_UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.1'})
+        with opener.open(req, timeout=self.timeout) as response:
+            final_url = response.geturl()
+            validate_public_url(final_url)
+            http_status = getattr(response, 'status', 200)
+            content_type = response.headers.get_content_type()
+            charset = response.headers.get_content_charset() or 'utf-8'
+            raw = response.read(self.max_bytes + 1)
+            page_bytes = len(raw)
+            if page_bytes > self.max_bytes:
+                raise ValueError('Candidate page exceeds size limit')
+            response_ms = int((time.monotonic() - start) * 1000)
+            analysis = parse_html(raw.decode(charset, 'replace'))
+            final_scheme = urllib.parse.urlsplit(final_url).scheme.lower()
+            return {**analysis, 'http_status': http_status, 'final_url': final_url,
+                    'hostname': urllib.parse.urlsplit(final_url).hostname, 'https': final_scheme == 'https',
+                    'https_status': 'VALID' if final_scheme == 'https' else 'NOT_HTTPS',
+                    'content_type': content_type, 'charset': charset,
+                    'page_bytes': page_bytes, 'response_ms': response_ms}
+    @staticmethod
+    def _classify_value_error(message):
+        low = message.lower()
+        if any(k in low for k in ('non-public', 'metadata', 'localhost', 'not a public', 'resolves to')):
+            return 'BLOCKED', 'SSRF_BLOCKED'
+        if 'dns' in low or 'name or service' in low or 'no address' in low:
+            return 'NOT_FOUND', 'DNS_FAILURE'
+        return 'INVALID', 'INVALID_URL'
+    def verify_website(self, organization_id, company_id, url=None):
+        """Verify a company website and record a CONNECTED/NOT_FOUND/INVALID/
+        BLOCKED/ERROR observation with technical metrics + history. The URL is
+        chosen server-side: the company's known website, or an explicitly provided
+        candidate (untrusted -> full SSRF). NEVER invents a URL from the name."""
+        with self.db_connect() as db:
+            row = db.execute('SELECT * FROM companies WHERE organization_id=? AND id=?', (organization_id, company_id)).fetchone()
+        if not row:
+            return {'status': 'NOT_FOUND', 'error_code': 'COMPANY_NOT_FOUND'}
+        company = dict(row)
+        candidate = canonical(url) if url else (canonical(company['website']) if company.get('website') else None)
+        if not candidate:
+            self._record_check(organization_id, company_id, 'Website', 'NOT_CHECKED', None,
+                               explanation='No website URL known; verify cannot claim NO_WEBSITE.',
+                               rule_version=WEBSITE_RULE_VERSION)
+            return {'status': 'NOT_CHECKED', 'message': 'No website URL available to verify.'}
+        self._record_check(organization_id, company_id, 'Website', 'CHECKING', candidate, rule_version=WEBSITE_RULE_VERSION)
+        try:
+            result = self.analyze_website(candidate)
+        except ValueError as exc:
+            status, code = self._classify_value_error(str(exc))
+            self._record_check(organization_id, company_id, 'Website', status, candidate,
+                               error_code=code, explanation=str(exc), rule_version=WEBSITE_RULE_VERSION)
+            return {'status': status, 'url': candidate, 'error_code': code, 'message': str(exc)}
+        except urllib.error.HTTPError as exc:
+            status = 'NOT_FOUND' if exc.code in (404, 410) else 'ERROR'
+            self._record_check(organization_id, company_id, 'Website', status, candidate,
+                               metrics={'http_status': exc.code}, explanation=f'HTTP {exc.code}', rule_version=WEBSITE_RULE_VERSION)
+            return {'status': status, 'url': candidate, 'http_status': exc.code}
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = str(exc)
+            status, code = self._classify_value_error(reason)
+            self._record_check(organization_id, company_id, 'Website', status, candidate,
+                               error_code=code, explanation=reason[:300], rule_version=WEBSITE_RULE_VERSION)
+            return {'status': status, 'url': candidate, 'message': reason[:300]}
+        status = 'CONNECTED' if 200 <= result['http_status'] < 400 else 'ERROR'
+        self._record_check(organization_id, company_id, 'Website', status, candidate,
+                           metrics=result, value=result.get('title'), rule_version=WEBSITE_RULE_VERSION)
+        with self.db_connect() as db:
+            db.execute("UPDATE companies SET website=?,website_status=?,updated_at=? WHERE organization_id=? AND id=?",
+                       (result['final_url'], status, now(), organization_id, company_id))
+        return {'status': status, 'url': candidate,
+                **{k: result[k] for k in ('http_status', 'final_url', 'https', 'https_status', 'title', 'h1', 'h1_count', 'meta_description', 'viewport', 'has_viewport', 'canonical', 'robots_meta', 'page_bytes', 'response_ms', 'charset')}}
+    def _record_check(self, org, company, channel, status, url=None, *, metrics=None, error_code=None,
+                      explanation=None, value=None, confidence=None, source_provider='website_verification',
+                      rule_version=None):
+        metrics = metrics or {}
+        check_id = 'digital_' + hashlib.sha256((org + '|' + company + '|' + channel).encode()).hexdigest()[:24]
+        cols = ['id', 'organization_id', 'company_id', 'channel', 'status', 'source_url', 'confidence', 'checked_at',
+                'details', 'source_provider', 'evidence', 'error_code', 'check_method', 'http_status', 'response_ms',
+                'page_bytes', 'https_status', 'final_url', 'value', 'explanation', 'rule_version']
+        vals = [check_id, org, company, channel, status, url, confidence, now(), json.dumps(metrics),
+                source_provider, json.dumps(metrics), error_code, 'WEBSITE_VERIFICATION',
+                metrics.get('http_status'), metrics.get('response_ms'), metrics.get('page_bytes'),
+                metrics.get('https_status'), metrics.get('final_url'), value or metrics.get('title'),
+                explanation, rule_version]
+        updates = ','.join(f"{c}=excluded.{c}" for c in cols if c not in ('id', 'organization_id', 'company_id', 'channel'))
+        ph = ','.join(['?'] * len(cols))
+        hid = 'dch_' + uuid.uuid4().hex[:24]
+        hcols = ['id', 'organization_id', 'company_id', 'channel', 'status', 'source_url', 'http_status',
+                 'response_ms', 'page_bytes', 'https_status', 'final_url', 'checked_at', 'details', 'rule_version']
+        hvals = [hid, org, company, channel, status, url, metrics.get('http_status'), metrics.get('response_ms'),
+                 metrics.get('page_bytes'), metrics.get('https_status'), metrics.get('final_url'), now(),
+                 json.dumps(metrics), rule_version]
+        with self.db_connect() as db:
+            db.execute(f"INSERT INTO digital_checks({','.join(cols)}) VALUES({ph}) ON CONFLICT(organization_id,company_id,channel) DO UPDATE SET {updates}", vals)
+            db.execute(f"INSERT INTO digital_check_history({','.join(hcols)}) VALUES({','.join(['?']*len(hcols))})", hvals)
     def _score(self,c,url,result,page):
         tokens=company_tokens(c['company_name']);hay=norm(' '.join([result.get('title',''),result.get('snippet',''),page.get('title',''),page.get('text','')[:10000]]));domain=norm(urllib.parse.urlsplit(url).hostname or '').replace('www ','');matched=sorted(t for t in tokens if t in hay);domain_matches=sorted(t for t in tokens if t in domain);score=0
         if tokens:score+=.4*len(matched)/len(tokens)+.2*len(domain_matches)/len(tokens)

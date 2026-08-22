@@ -16,6 +16,9 @@ from nace_importer import OfficialNaceImporter
 from website_intelligence import WebsiteDiscoveryEngine, DigitalFootprintEngine
 from seo_engine import SEOAuditEngine, BusinessSignalEngine
 from people_engine import PeopleEngine
+import import_pipeline as pipeline
+import resa_pipeline as resapipe
+import outreach as outreach_engine
 
 PEOPLE_ENGINE=PeopleEngine(data.connect)
 SEO_AUDIT=SEOAuditEngine(data.connect)
@@ -124,12 +127,49 @@ class API(BaseHTTPRequestHandler):
                     return self.json({"status":"CONNECTED","provider":"supabase-postgresql",**connection_test()})
                 return self.json({"status":"LOCAL_FALLBACK","provider":"sqlite","message":"Set DATABASE_URL and DB_PROVIDER=postgresql to activate Supabase."})
             if path=="/api/v1/dashboard": return self.dashboard()
-            if path=="/api/v1/companies": return self.json({"items":data.list_companies(self.org,q)})
+            if path=="/api/v1/companies":
+                limit=min(max(int(q.get("limit",25) or 25),1),100); offset=max(int(q.get("offset",0) or 0),0)
+                items=data.list_companies(self.org,q,limit,offset); total=data.count_companies(self.org,q)
+                return self.json({"items":items,"pagination":{"total":total,"limit":limit,"offset":offset,"page":offset//limit+1,"pages":(total+limit-1)//limit}})
             if path.startswith("/api/v1/companies/"): 
                 item=data.company_detail(self.org,path.rsplit("/",1)[-1]); return self.json(item if item else {"error":"Not found"},200 if item else 404)
-            if path=="/api/v1/opportunities": return self.json({"items":data.list_companies(self.org,q)})
+            if path=="/api/v1/opportunities":
+                limit=min(max(int(q.get("limit",25) or 25),1),100); offset=max(int(q.get("offset",0) or 0),0)
+                where=["o.organization_id=?"]; params=[self.org]
+                if q.get("search"): where.append("(c.company_name LIKE ? OR c.rcs_number LIKE ?)"); t=f"%{q['search']}%"; params += [t,t]
+                if q.get("level"): where.append("o.level=?"); params.append(q["level"].upper().replace("_"," "))
+                if q.get("score_min"): where.append("o.score>=?"); params.append(int(q["score_min"]))
+                if q.get("score_max"): where.append("o.score<=?"); params.append(int(q["score_max"]))
+                if q.get("municipality"): where.append("c.municipality=?"); params.append(q["municipality"])
+                sort=q.get("sort","highest_score")
+                order={"highest_score":"o.score DESC,c.company_name","lowest_score":"o.score ASC,c.company_name","newest":"c.created_at DESC","recently_updated":"o.calculated_at DESC"}.get(sort,"o.score DESC,c.company_name")
+                clause=" AND ".join(where)
+                total=data.one(f"SELECT count(*) count FROM opportunity_scores o JOIN companies c ON c.id=o.company_id AND c.organization_id=o.organization_id WHERE {clause}",params)['count']
+                items=data.rows(f"""SELECT c.id company_id,c.company_name,c.legal_form,c.rcs_number,c.creation_date,c.municipality,c.website_status,
+                    o.score,o.level,o.recommended_action,o.model_version,o.fingerprint,o.calculated_at,o.breakdown,o.factor_snapshot,
+                    (SELECT count(*) FROM business_signals s WHERE s.organization_id=o.organization_id AND s.company_id=o.company_id AND s.status='ACTIVE') accepted_signals,
+                    (SELECT count(*) FROM business_signals s WHERE s.organization_id=o.organization_id AND s.company_id=o.company_id AND s.status!='ACTIVE') rejected_signals
+                    FROM opportunity_scores o JOIN companies c ON c.id=o.company_id AND c.organization_id=o.organization_id
+                    WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?""",params+[limit,offset])
+                return self.json({"items":items,"pagination":{"total":total,"limit":limit,"offset":offset,"page":offset//limit+1,"pages":(total+limit-1)//limit}})
+            if path.startswith("/api/v1/opportunities/"):
+                cid=path.rsplit("/",1)[-1]
+                detail=data.company_detail(self.org,cid)
+                if not detail: return self.json({"error":"Not found"},404)
+                # accepted/rejected signals
+                accepted=data.rows("SELECT signal_type,severity,confidence,explanation,data_quality,last_seen_at FROM business_signals WHERE organization_id=? AND company_id=? AND status='ACTIVE'",(self.org,cid))
+                rejected=data.rows("SELECT signal_type,severity,confidence,explanation,data_quality,last_seen_at,status FROM business_signals WHERE organization_id=? AND company_id=? AND status!='ACTIVE'",(self.org,cid))
+                history=data.rows("SELECT model_version,total_score,level,recommended_action,fingerprint,created_at FROM opportunity_score_history WHERE organization_id=? AND company_id=? ORDER BY created_at DESC LIMIT 20",(self.org,cid))
+                # validation status
+                validation=data.one("SELECT validation_status,validated_by,validated_at,validation_comment FROM companies WHERE organization_id=? AND id=?",(self.org,cid))
+                return self.json({"company":detail,"accepted_signals":accepted,"rejected_signals":rejected,"score_history":history,"validation":{"status":(validation["validation_status"] if validation else "REVIEW_PENDING"),"reviewer":(validation["validated_by"] if validation else None),"reviewed_at":(validation["validated_at"] if validation else None),"comment":(validation["validation_comment"] if validation else None)}})
+            if path.startswith("/api/v1/opportunities/") and path.endswith("/outreach"):
+                cid=path.split("/")[-2]
+                result=outreach_engine.prepare_outreach(self.org,cid)
+                return self.json(result,200 if result.get("status")=="SUCCESS" else 422)
             if path=="/api/v1/prospects": return self.json({"items":data.rows("""SELECT p.*,c.company_name,c.municipality,o.score FROM prospects p JOIN companies c ON c.id=p.company_id AND c.organization_id=p.organization_id JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE p.organization_id=? ORDER BY p.updated_at DESC""",(self.org,))})
             if path=="/api/v1/sources": return self.json({"items":data.rows("SELECT * FROM data_sources WHERE organization_id=? ORDER BY name",(self.org,)),"jobs":data.rows("SELECT * FROM jobs WHERE organization_id=? ORDER BY started_at DESC LIMIT 20",(self.org,))})
+            if path=="/api/v1/imports": return self.json({"items":data.rows("SELECT id,source_id,import_type,status,records_received,records_valid,records_created,records_updated,records_skipped,records_failed,started_at,finished_at FROM imports WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
             if path=="/api/v1/filters": return self.filters()
             if path=="/api/v1/export/companies.csv": return self.export_csv(q)
             if path.startswith('/api/v1/nace/') and path!='/api/v1/nace/import':
@@ -137,10 +177,18 @@ class API(BaseHTTPRequestHandler):
                 if not item:return self.json({'error':'NACE code not found'},404)
                 item['labels']=data.rows("SELECT language,label_type,label FROM nace_labels_official WHERE item_id=? ORDER BY language",(item['id'],));item['notes']=data.rows("SELECT note_type,language,note_text,note_uri,source_url FROM nace_notes_official WHERE item_id=? ORDER BY note_type",(item['id'],));item['children']=data.rows("SELECT i.code,i.level,l.label FROM nace_items_official i LEFT JOIN nace_labels_official l ON l.item_id=i.id AND l.language=? AND l.label_type='PREF' WHERE i.version_id=? AND i.parent_code=? AND i.is_current=1 ORDER BY i.sort_order,i.code",(q.get('lang','fr').lower(),item['version_id'],code));item['from_rev2']=data.rows("SELECT source_code,target_code,relationship,mapping_uri,source_url FROM nace_correspondences_official WHERE source_version='2' AND target_version='2.1' AND target_code=? ORDER BY source_code",(code,));return self.json(item)
             if path=="/api/v1/nace":
-                lang=q.get('lang','fr').lower();level=q.get('level');params=[lang];where="WHERE v.version_code='2.1' AND i.is_current=1"
-                if level:where+=' AND i.level=?';params.append(level.upper())
-                items=data.rows(f"SELECT i.code,i.level,i.parent_code,i.sort_order,i.concept_uri,l.label,v.status source_status,v.source_url,v.retrieved_at FROM nace_items_official i JOIN nace_versions_official v ON v.id=i.version_id LEFT JOIN nace_labels_official l ON l.item_id=i.id AND l.language=? AND l.label_type='PREF' {where} ORDER BY i.sort_order,i.code",params)
-                return self.json({"version":"2.1","languages":["FR","DE","EN"],"status":NACE_IMPORTER.status(),"counts":{r['level']:r['count'] for r in data.rows("SELECT level,count(*) count FROM nace_items_official i JOIN nace_versions_official v ON v.id=i.version_id WHERE v.version_code='2.1' AND i.is_current=1 GROUP BY level")},"items":items})
+                lang=q.get('language',q.get('lang','fr')).lower();version=q.get('version','2.1');level=q.get('level');code=q.get('code');term=q.get('q')
+                limit=min(max(int(q.get('limit',50) or 50),1),200);offset=max(int(q.get('offset',0) or 0),0)
+                where=["v.version_code=?","i.is_current"];params=[version]
+                if level:where.append("i.level=?");params.append(level.upper())
+                if code:where.append("(i.code=? OR i.code LIKE ?)");params+=[code,code+'%']
+                if term:where.append("LOWER(COALESCE(l.label,'')) LIKE ?");params.append('%'+str(term).lower()+'%')
+                clause=' AND '.join(where)
+                base=f"FROM nace_items_official i JOIN nace_versions_official v ON v.id=i.version_id LEFT JOIN nace_labels_official l ON l.item_id=i.id AND l.language=? AND l.label_type='PREF' WHERE {clause}"
+                cparams=[lang]+params
+                total=data.one(f"SELECT count(*) count {base}",cparams)['count']
+                items=data.rows(f"SELECT i.code,i.level,i.parent_code,i.sort_order,i.concept_uri,l.label,v.status source_status,v.source_url,v.retrieved_at {base} ORDER BY i.sort_order,i.code LIMIT ? OFFSET ?",cparams+[limit,offset])
+                return self.json({"version":version,"languages":["FR","DE","EN"],"status":NACE_IMPORTER.status(),"counts":{r['level']:r['count'] for r in data.rows("SELECT level,count(*) count FROM nace_items_official i JOIN nace_versions_official v ON v.id=i.version_id WHERE v.version_code=? AND i.is_current GROUP BY level",(version,))},"pagination":{"total":total,"limit":limit,"offset":offset},"items":items})
             if path=="/api/v1/taxonomy": return self.json({"items":data.rows("SELECT n.*,p.name parent_name FROM taxonomy_nodes n LEFT JOIN taxonomy_nodes p ON p.id=n.parent_id WHERE n.organization_id=? ORDER BY n.node_type,n.name",(self.org,))})
             if path=="/api/v1/people": return self.json({"engine":PEOPLE_ENGINE.status(),"items":data.rows("SELECT p.*,c.company_name,c.municipality,(SELECT count(*) FROM people_evidence e WHERE e.person_id=p.id AND e.organization_id=p.organization_id) evidence_count FROM people p LEFT JOIN companies c ON c.id=p.company_id AND c.organization_id=p.organization_id WHERE p.organization_id=? AND COALESCE(p.privacy_status,'ACTIVE')!='SUPPRESSED' ORDER BY p.confidence DESC",(self.org,)),"profiles":data.rows("SELECT pr.*,p.display_name,c.company_name FROM professional_profiles_public pr JOIN people p ON p.id=pr.person_id AND p.organization_id=pr.organization_id JOIN companies c ON c.id=pr.company_id AND c.organization_id=pr.organization_id WHERE pr.organization_id=? AND pr.match_confidence>=? ORDER BY pr.match_confidence DESC",(self.org,PEOPLE_ENGINE.threshold)),"runs":data.rows("SELECT r.*,c.company_name FROM people_engine_runs r JOIN companies c ON c.id=r.company_id AND c.organization_id=r.organization_id WHERE r.organization_id=? ORDER BY r.started_at DESC LIMIT 100",(self.org,))})
             if path=="/api/v1/digital": return self.json({"engine":DIGITAL_FOOTPRINT.status(),"items":data.rows("SELECT d.*,c.company_name,c.municipality FROM digital_checks d JOIN companies c ON c.id=d.company_id AND c.organization_id=d.organization_id WHERE d.organization_id=? ORDER BY c.company_name,d.channel",(self.org,)),"discoveries":data.rows("SELECT r.*,c.company_name FROM website_discovery_runs r JOIN companies c ON c.id=r.company_id AND c.organization_id=r.organization_id WHERE r.organization_id=? ORDER BY r.started_at DESC LIMIT 100",(self.org,)),"candidates":data.rows("SELECT * FROM website_candidates WHERE organization_id=? ORDER BY checked_at DESC,confidence DESC LIMIT 200",(self.org,))})
@@ -150,7 +198,23 @@ class API(BaseHTTPRequestHandler):
                 extraction_id=path.rsplit('/',1)[-1];item=data.one("SELECT * FROM document_extractions WHERE organization_id=? AND id=?",(self.org,extraction_id))
                 if not item:return self.json({'error':'Extraction not found'},404)
                 item['pages']=data.rows("SELECT * FROM document_page_extractions WHERE organization_id=? AND extraction_id=? ORDER BY page_number",(self.org,extraction_id));return self.json(item)
-            if path=="/api/v1/resa": return self.json({"connector":RESA_CONNECTOR.status(),"storage":PDF_STORAGE.status(),"extraction_engine":PDF_EXTRACTION.status(),"extractions":data.rows("SELECT id,document_id,status,extraction_method,page_count,ocr_pages,char_count,quality_score,completed_at,error_code,error_message FROM document_extractions WHERE organization_id=? ORDER BY started_at DESC LIMIT 100",(self.org,)),"journals":data.rows("SELECT * FROM resa_journals WHERE organization_id=? ORDER BY last_seen_at DESC",(self.org,)),"items":data.rows("SELECT e.*,j.journal_key,(SELECT count(*) FROM resa_documents d WHERE d.entry_id=e.id AND d.organization_id=e.organization_id) document_count FROM resa_entries e JOIN resa_journals j ON j.id=e.journal_id WHERE e.organization_id=? ORDER BY j.last_seen_at DESC,e.row_index",(self.org,)),"documents":data.rows("SELECT * FROM resa_documents WHERE organization_id=? ORDER BY last_seen_at DESC LIMIT 500",(self.org,)),"runs":data.rows("SELECT * FROM resa_sync_runs WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
+            if path=="/api/v1/resa": return self.json({"connector":RESA_CONNECTOR.status(),"storage":PDF_STORAGE.status(),"extraction_engine":PDF_EXTRACTION.status(),"pipeline":{"source_id":resapipe.SOURCE_ID,"status":"REQUIRES_CONFIGURATION" if RESA_CONNECTOR.status()["status"]!="READY" else "READY"},"extractions":data.rows("SELECT id,document_id,status,extraction_method,page_count,ocr_pages,char_count,quality_score,completed_at,error_code,error_message FROM document_extractions WHERE organization_id=? ORDER BY started_at DESC LIMIT 100",(self.org,)),"journals":data.rows("SELECT * FROM resa_journals WHERE organization_id=? ORDER BY last_seen_at DESC",(self.org,)),"items":data.rows("SELECT e.*,j.journal_key,(SELECT count(*) FROM resa_documents d WHERE d.entry_id=e.id AND d.organization_id=e.organization_id) document_count FROM resa_entries e JOIN resa_journals j ON j.id=e.journal_id WHERE e.organization_id=? ORDER BY j.last_seen_at DESC,e.row_index",(self.org,)),"documents":data.rows("SELECT * FROM resa_documents WHERE organization_id=? ORDER BY last_seen_at DESC LIMIT 500",(self.org,)),"runs":data.rows("SELECT * FROM resa_sync_runs WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
+            if path.startswith("/api/v1/resa/provenance/"):
+                cid=path.rsplit("/",1)[-1]; chain=resapipe.provenance(self.org,cid)
+                return self.json(chain if chain else {"error":"Not found"},200 if chain else 404)
+            if path=="/api/v1/resa/documents":
+                limit=min(max(int(q.get("limit",50) or 50),1),200); offset=max(int(q.get("offset",0) or 0),0)
+                return self.json({"items":data.rows("SELECT id,document_url,canonical_url,document_type,download_status,extraction_status,link_text,storage_provider,storage_key,size_bytes,first_seen_at,last_seen_at FROM resa_documents WHERE organization_id=? ORDER BY last_seen_at DESC LIMIT ? OFFSET ?",(self.org,limit,offset))})
+            if path.startswith("/api/v1/resa/documents/") and path.endswith("/pages"):
+                did=path.split("/")[-2]
+                return self.json({"document_id":did,"pages":data.rows("SELECT p.page_number,p.extraction_method,p.text_content,p.char_count,p.confidence,p.quality_score FROM document_page_extractions p JOIN document_extractions e ON e.id=p.extraction_id AND e.organization_id=p.organization_id WHERE p.organization_id=? AND p.document_id=? ORDER BY p.page_number",(self.org,did))})
+            if path.startswith("/api/v1/resa/documents/") and path.endswith("/evidence"):
+                did=path.split("/")[-2]
+                return self.json({"document_id":did,"people":data.rows("SELECT id,display_name,job_title,official_role,source_type,match_status,confidence,review_status,reviewer,reviewed_at,review_comment,source_page,evidence_excerpt FROM people WHERE organization_id=? AND source_extraction_id IN (SELECT id FROM document_extractions WHERE organization_id=? AND document_id=?)",(self.org,self.org,did))})
+            if path.startswith("/api/v1/resa/documents/"):
+                did=path.rsplit("/",1)[-1]; doc=data.one("SELECT * FROM resa_documents WHERE organization_id=? AND id=?",(self.org,did))
+                if not doc: return self.json({"error":"Not found"},404)
+                return self.json({"document":doc,"extractions":data.rows("SELECT id,status,extraction_method,page_count,extracted_pages,ocr_pages,char_count,quality_score,ocr_language,engine_version,started_at,completed_at,error_code,error_message FROM document_extractions WHERE organization_id=? AND document_id=? ORDER BY started_at DESC",(self.org,did))})
             if path=="/api/v1/reports": return self.json({"items":data.rows("SELECT * FROM reports WHERE organization_id=? ORDER BY created_at DESC",(self.org,))})
             if path=="/api/v1/logs": return self.json({"items":data.rows("SELECT * FROM audit_logs WHERE organization_id=? ORDER BY created_at DESC LIMIT 100",(self.org,))})
             if path=="/api/v1/organization/members": return self.json({"items":data.rows("SELECT u.id,u.email,u.display_name,m.role FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.organization_id=? ORDER BY CASE m.role WHEN 'OWNER' THEN 1 WHEN 'ADMIN' THEN 2 ELSE 3 END,u.display_name",(self.org,))})
@@ -202,6 +266,23 @@ class API(BaseHTTPRequestHandler):
             company_id=path.split('/')[-2];result=DIGITAL_FOOTPRINT.analyze(self.org,company_id)
             with data.connect() as db:data.recalculate_all(db,self.org)
             data.audit(self.org,'DIGITAL_FOOTPRINT_CHECK','company',company_id,{'status':result.get('status'),'digital_score':result.get('digital_score')});return self.json(result,200 if result.get('status')=='SUCCESS' else 422)
+        if path=="/api/v1/digital/check":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            url=str(body.get('url','')).strip() or None
+            result=WEBSITE_DISCOVERY.verify_website(self.org,company_id,url)
+            data.audit(self.org,'WEBSITE_VERIFY','company',company_id,{'status':result.get('status'),'url':result.get('url')})
+            return self.json(result,200 if result.get('status') in ('CONNECTED','NOT_CHECKED') else 422)
+        if path=="/api/v1/websites/discover":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            result=WEBSITE_DISCOVERY.discover(self.org,company_id)
+            data.audit(self.org,'WEBSITE_DISCOVERY','company',company_id,{'status':result.get('status')})
+            return self.json(result,200 if result.get('status') in ('FOUND','NOT_FOUND','NOT_CONFIGURED') else 422)
         if path=="/api/v1/nace/import":
             result=NACE_IMPORTER.import_official();data.audit(self.org,'IMPORT_OFFICIAL_NACE','nace_version','2.1',result)
             return self.json(result,200 if result.get('status')=='SUCCESS' else 422)
@@ -213,6 +294,23 @@ class API(BaseHTTPRequestHandler):
             document_id=path.split('/')[-2];result=PDF_EXTRACTION.extract_document(self.org,document_id,bool(body.get('force_ocr',False)))
             data.audit(self.org,'EXTRACT_RESA_PDF','resa_document',document_id,{'status':result.get('status'),'method':result.get('method'),'extraction_id':result.get('extraction_id')})
             return self.json(result,200 if result.get('status') in ('SUCCESS','PARTIAL','ALREADY_EXTRACTED') else 422)
+        if path.startswith('/api/v1/resa/documents/') and path.endswith('/people'):
+            document_id=path.split('/')[-2]
+            ext=data.one("SELECT id FROM document_extractions WHERE organization_id=? AND document_id=? AND status IN ('SUCCESS','PARTIAL') ORDER BY started_at DESC LIMIT 1",(self.org,document_id))
+            if not ext:return self.json({'error':'No successful extraction for this document'},404)
+            result=PDF_EXTRACTION.extract_people(self.org,ext['id'])
+            data.audit(self.org,'EXTRACT_PEOPLE_PDF','resa_document',document_id,{'people_found':result.get('people_found')})
+            return self.json(result,200)
+        if path.startswith('/api/v1/resa/documents/') and path.endswith('/review'):
+            document_id=path.split('/')[-2]
+            person_id=str(body.get('person_id','')).strip();decision=str(body.get('decision','')).upper();comment=str(body.get('comment',''))[:1000]
+            if decision not in ('APPROVED','REJECTED'):return self.json({'error':'decision must be APPROVED or REJECTED'},400)
+            person=data.one("SELECT id,official_role,review_status FROM people WHERE organization_id=? AND id=?",(self.org,person_id))
+            if not person:return self.json({'error':'Person not found'},404)
+            ctx=self.auth_context
+            with data.connect() as db:db.execute("UPDATE people SET review_status=?,reviewer=?,reviewed_at=?,review_comment=? WHERE organization_id=? AND id=?",(decision,ctx['user_id'],data.now(),comment,self.org,person_id))
+            data.audit(self.org,'REVIEW_PERSON','person',person_id,{'decision':decision,'previous':person['review_status'],'document':document_id,'comment':comment})
+            return self.json({'status':'SUCCESS','review_status':decision})
         if path=="/api/v1/resa/analyze":
             source_url=str(body.get('source_url','')).strip()
             try:result=RESA_CONNECTOR.analyze(self.org,source_url,allow_browser=body.get('allow_browser',True))
@@ -300,12 +398,68 @@ class API(BaseHTTPRequestHandler):
         if path=="/api/v1/import/preview":
             rows=body.get('rows',[])
             if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or preview limit exceeded"},400)
-            required=['company_name']; preview=[]
-            for i,r in enumerate(rows):
-                errors=[f"Missing {k}" for k in required if not str(r.get(k,'')).strip()]
-                duplicate=bool(r.get('rcs_number') and data.one("SELECT id FROM companies WHERE organization_id=? AND rcs_number=?",(self.org,r.get('rcs_number'))))
-                preview.append({'row':i+1,'valid':not errors and not duplicate,'duplicate':duplicate,'errors':errors,'data':r})
-            return self.json({'total':len(rows),'valid':sum(1 for x in preview if x['valid']),'items':preview})
+            source=body.get('source') or {}
+            # Dry run only: the pipeline reads existing data but writes nothing.
+            return self.json(pipeline.preview(self.org,source,rows))
+        if path=="/api/v1/opportunities/validate":
+            company_id=str(body.get('company_id','')).strip(); decision=str(body.get('decision','')).upper().strip(); comment=str(body.get('comment',''))[:2000]
+            if decision not in ('APPROVED','REJECTED','DISMISSED','REVIEW_PENDING'):return self.json({'error':'decision must be APPROVED, REJECTED, DISMISSED, or REVIEW_PENDING'},400)
+            company=data.one("SELECT id,validation_status FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            prev=company['validation_status'] or 'REVIEW_PENDING'; ctx=self.auth_context; ts=data.now()
+            with data.connect() as db:
+                db.execute("UPDATE companies SET validation_status=?,validated_by=?,validated_at=?,validation_comment=?,updated_at=? WHERE organization_id=? AND id=?",(decision,ctx['user_id'],ts,comment,ts,self.org,company_id))
+                db.execute("INSERT INTO opportunity_validations(id,organization_id,company_id,previous_status,new_status,reviewer,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",("ov_"+str(uuid.uuid4())[:24],self.org,company_id,prev,decision,ctx['user_id'],comment,ts))
+            data.audit(self.org,'VALIDATE_OPPORTUNITY','company',company_id,{'previous':prev,'new':decision,'comment':comment})
+            return self.json({'status':'SUCCESS','validation_status':decision,'previous_status':prev})
+        if path=="/api/v1/outreach/draft":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            result=outreach_engine.prepare_outreach(self.org,company_id)
+            if result.get('status')!='SUCCESS':return self.json(result,422)
+            draft=result['draft']
+            did='od_'+str(uuid.uuid4())[:24];ts=data.now()
+            with data.connect() as db:
+                db.execute("INSERT INTO outreach_drafts(id,organization_id,company_id,provider,model,prompt_version,input_hash,output_hash,subject,greeting,body,claims,evidence_references,confidence,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (did,self.org,company_id,draft.get('provider'),draft.get('model'),draft.get('prompt_version'),draft.get('input_hash'),draft.get('output_hash'),draft.get('subject'),draft.get('greeting'),draft.get('body'),json.dumps(draft.get('claims',[])),json.dumps(draft.get('evidence_references',[])),draft.get('confidence'),'DRAFT',ts))
+            data.audit(self.org,'OUTREACH_DRAFT','outreach_draft',did,{'company':company_id,'provider':draft.get('provider')})
+            result['draft_id']=did;return self.json(result,201)
+        if path=="/api/v1/outreach/review":
+            draft_id=str(body.get('draft_id','')).strip(); decision=str(body.get('decision','')).upper().strip(); comment=str(body.get('comment',''))[:2000]
+            if decision not in ('APPROVED','REJECTED','READY_TO_SEND','REVIEW_REQUIRED'):return self.json({'error':'decision must be APPROVED, REJECTED, READY_TO_SEND, or REVIEW_REQUIRED'},400)
+            draft=data.one("SELECT id,review_status FROM outreach_drafts WHERE organization_id=? AND id=?",(self.org,draft_id))
+            if not draft:return self.json({'error':'Draft not found'},404)
+            prev=draft['review_status'] or 'DRAFT'; ctx=self.auth_context; ts=data.now()
+            edited_subject=body.get('edited_subject'); edited_body=body.get('edited_body')
+            with data.connect() as db:
+                updates="review_status=?,reviewer=?,reviewed_at=?,review_comment=?"
+                params=[decision,ctx['user_id'],ts,comment]
+                if edited_subject is not None:updates+=",edited_subject=?";params.append(edited_subject)
+                if edited_body is not None:updates+=",edited_body=?";params.append(edited_body)
+                params += [self.org,draft_id]
+                db.execute(f"UPDATE outreach_drafts SET {updates} WHERE organization_id=? AND id=?",params)
+                db.execute("INSERT INTO outreach_reviews(id,organization_id,draft_id,previous_status,new_status,reviewer,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",("or_"+str(uuid.uuid4())[:24],self.org,draft_id,prev,decision,ctx['user_id'],comment,ts))
+            data.audit(self.org,'OUTREACH_REVIEW','outreach_draft',draft_id,{'previous':prev,'new':decision,'comment':comment})
+            return self.json({'status':'SUCCESS','review_status':decision,'previous_status':prev,'ready_to_send':decision=='READY_TO_SEND'})
+        if path=="/api/v1/import":
+            rows=body.get('rows',[])
+            if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or limit exceeded"},400)
+            source=body.get('source') or {}
+            import_id="imp_"+str(uuid.uuid4())[:12]
+            try:
+                stats=pipeline.run(self.org,source,rows,import_id=import_id)
+            except Exception as exc:
+                # The atomic run rolled back; record a FAILED import separately.
+                print(f"[import] FAILED import_id={import_id} detail={data.redact_error(exc)}",file=sys.stderr)
+                try:
+                    with data.connect() as db:
+                        db.execute("INSERT INTO imports(id,organization_id,source_id,import_type,status,records_received,records_failed,error_summary,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(import_id,self.org,source.get('source_id'),source.get('import_type') or 'COMPANIES','FAILED',len(rows),len(rows),data.redact_error(exc),data.now(),data.now()))
+                except Exception: pass
+                return self.json({"error":"Import failed","import_id":import_id},500)
+            data.audit(self.org,"IMPORT_COMPANIES","import",import_id,{"source":source.get("name"),"import_type":source.get("import_type") or "COMPANIES","created":stats["created"],"updated":stats["updated"],"failed":stats["failed"]})
+            return self.json({"import_id":import_id,"status":"PARTIAL" if stats["failed"] else "SUCCESS",**stats},201)
         return self.json({"error":"Not found"},404)
     def auth_post(self,path,body):
         if not AUTH_ACTIVE:return self.json({'error':'Supabase Auth requires both Supabase credentials and PostgreSQL','code':'AUTH_NOT_CONFIGURED'},503)
@@ -361,7 +515,9 @@ class API(BaseHTTPRequestHandler):
     def dashboard(self):
         items=data.list_companies(self.org,{})
         def n(pred): return sum(1 for x in items if pred(x))
-        today={"new_companies":n(lambda x:(x.get("creation_date") or "") >= __import__('datetime').date.today().isoformat()),"new_opportunities":n(lambda x:x["opportunity_score"]>=75),"high_priority":n(lambda x:x["opportunity_score"]>=90),"without_website":n(lambda x:x["website_status"]=="NOT_FOUND"),"weak_seo":n(lambda x:x.get("seo_score") is not None and x["seo_score"]<50),"without_google":n(lambda x:x["google_status"]=="NOT_FOUND"),"decision_makers":n(lambda x:x["decision_maker_status"]=="FOUND")}
+        sig_active=data.one("SELECT count(*) count FROM business_signals WHERE organization_id=? AND status='ACTIVE'",(self.org,))['count']
+        sig_high=data.one("SELECT count(*) count FROM business_signals WHERE organization_id=? AND status='ACTIVE' AND severity IN ('HIGH','POSITIVE')",(self.org,))['count']
+        today={"new_companies":n(lambda x:(x.get("creation_date") or "") >= __import__('datetime').date.today().isoformat()),"new_opportunities":n(lambda x:(x.get("opportunity_score") or 0)>=75),"high_priority":n(lambda x:(x.get("opportunity_score") or 0)>=90),"without_website":n(lambda x:x["website_status"]=="NOT_FOUND"),"weak_seo":n(lambda x:x.get("seo_score") is not None and x["seo_score"]<50),"without_google":n(lambda x:x["google_status"]=="NOT_FOUND"),"decision_makers":n(lambda x:x["decision_maker_status"]=="FOUND"),"active_signals":sig_active,"high_priority_signals":sig_high}
         def group(field):
             out={}
             for x in items: out[x.get(field) or "Unknown"]=out.get(x.get(field) or "Unknown",0)+1
