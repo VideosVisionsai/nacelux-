@@ -16,6 +16,7 @@ from nace_importer import OfficialNaceImporter
 from website_intelligence import WebsiteDiscoveryEngine, DigitalFootprintEngine
 from seo_engine import SEOAuditEngine, BusinessSignalEngine
 from people_engine import PeopleEngine
+import import_pipeline as pipeline
 
 PEOPLE_ENGINE=PeopleEngine(data.connect)
 SEO_AUDIT=SEOAuditEngine(data.connect)
@@ -124,12 +125,16 @@ class API(BaseHTTPRequestHandler):
                     return self.json({"status":"CONNECTED","provider":"supabase-postgresql",**connection_test()})
                 return self.json({"status":"LOCAL_FALLBACK","provider":"sqlite","message":"Set DATABASE_URL and DB_PROVIDER=postgresql to activate Supabase."})
             if path=="/api/v1/dashboard": return self.dashboard()
-            if path=="/api/v1/companies": return self.json({"items":data.list_companies(self.org,q)})
+            if path=="/api/v1/companies":
+                limit=min(max(int(q.get("limit",25) or 25),1),100); offset=max(int(q.get("offset",0) or 0),0)
+                items=data.list_companies(self.org,q,limit,offset); total=data.count_companies(self.org,q)
+                return self.json({"items":items,"pagination":{"total":total,"limit":limit,"offset":offset,"page":offset//limit+1,"pages":(total+limit-1)//limit}})
             if path.startswith("/api/v1/companies/"): 
                 item=data.company_detail(self.org,path.rsplit("/",1)[-1]); return self.json(item if item else {"error":"Not found"},200 if item else 404)
             if path=="/api/v1/opportunities": return self.json({"items":data.list_companies(self.org,q)})
             if path=="/api/v1/prospects": return self.json({"items":data.rows("""SELECT p.*,c.company_name,c.municipality,o.score FROM prospects p JOIN companies c ON c.id=p.company_id AND c.organization_id=p.organization_id JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE p.organization_id=? ORDER BY p.updated_at DESC""",(self.org,))})
             if path=="/api/v1/sources": return self.json({"items":data.rows("SELECT * FROM data_sources WHERE organization_id=? ORDER BY name",(self.org,)),"jobs":data.rows("SELECT * FROM jobs WHERE organization_id=? ORDER BY started_at DESC LIMIT 20",(self.org,))})
+            if path=="/api/v1/imports": return self.json({"items":data.rows("SELECT id,source_id,import_type,status,records_received,records_valid,records_created,records_updated,records_skipped,records_failed,started_at,finished_at FROM imports WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
             if path=="/api/v1/filters": return self.filters()
             if path=="/api/v1/export/companies.csv": return self.export_csv(q)
             if path.startswith('/api/v1/nace/') and path!='/api/v1/nace/import':
@@ -300,12 +305,26 @@ class API(BaseHTTPRequestHandler):
         if path=="/api/v1/import/preview":
             rows=body.get('rows',[])
             if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or preview limit exceeded"},400)
-            required=['company_name']; preview=[]
-            for i,r in enumerate(rows):
-                errors=[f"Missing {k}" for k in required if not str(r.get(k,'')).strip()]
-                duplicate=bool(r.get('rcs_number') and data.one("SELECT id FROM companies WHERE organization_id=? AND rcs_number=?",(self.org,r.get('rcs_number'))))
-                preview.append({'row':i+1,'valid':not errors and not duplicate,'duplicate':duplicate,'errors':errors,'data':r})
-            return self.json({'total':len(rows),'valid':sum(1 for x in preview if x['valid']),'items':preview})
+            source=body.get('source') or {}
+            # Dry run only: the pipeline reads existing data but writes nothing.
+            return self.json(pipeline.preview(self.org,source,rows))
+        if path=="/api/v1/import":
+            rows=body.get('rows',[])
+            if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or limit exceeded"},400)
+            source=body.get('source') or {}
+            import_id="imp_"+str(uuid.uuid4())[:12]
+            try:
+                stats=pipeline.run(self.org,source,rows,import_id=import_id)
+            except Exception as exc:
+                # The atomic run rolled back; record a FAILED import separately.
+                print(f"[import] FAILED import_id={import_id} detail={data.redact_error(exc)}",file=sys.stderr)
+                try:
+                    with data.connect() as db:
+                        db.execute("INSERT INTO imports(id,organization_id,source_id,import_type,status,records_received,records_failed,error_summary,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(import_id,self.org,source.get('source_id'),source.get('import_type') or 'COMPANIES','FAILED',len(rows),len(rows),data.redact_error(exc),data.now(),data.now()))
+                except Exception: pass
+                return self.json({"error":"Import failed","import_id":import_id},500)
+            data.audit(self.org,"IMPORT_COMPANIES","import",import_id,{"source":source.get("name"),"import_type":source.get("import_type") or "COMPANIES","created":stats["created"],"updated":stats["updated"],"failed":stats["failed"]})
+            return self.json({"import_id":import_id,"status":"PARTIAL" if stats["failed"] else "SUCCESS",**stats},201)
         return self.json({"error":"Not found"},404)
     def auth_post(self,path,body):
         if not AUTH_ACTIVE:return self.json({'error':'Supabase Auth requires both Supabase credentials and PostgreSQL','code':'AUTH_NOT_CONFIGURED'},503)

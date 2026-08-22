@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS nace_notes_official(id TEXT PRIMARY KEY,item_id TEXT 
 CREATE TABLE IF NOT EXISTS nace_correspondences_official(id TEXT PRIMARY KEY,source_version TEXT NOT NULL,target_version TEXT NOT NULL,source_code TEXT NOT NULL,target_code TEXT NOT NULL,relationship TEXT,mapping_uri TEXT NOT NULL,source_url TEXT NOT NULL,retrieved_at TEXT NOT NULL,UNIQUE(source_version,target_version,source_code,target_code,mapping_uri));
 CREATE TABLE IF NOT EXISTS nace_import_runs(id TEXT PRIMARY KEY,version_code TEXT NOT NULL,status TEXT NOT NULL,source_url TEXT NOT NULL,source_checksum TEXT,started_at TEXT NOT NULL,completed_at TEXT,sections INTEGER DEFAULT 0,divisions INTEGER DEFAULT 0,groups_count INTEGER DEFAULT 0,classes INTEGER DEFAULT 0,labels INTEGER DEFAULT 0,notes INTEGER DEFAULT 0,correspondences INTEGER DEFAULT 0,error_code TEXT,error_message TEXT,metadata TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS resa_sync_runs(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,journal_id TEXT,source_url TEXT NOT NULL,status TEXT NOT NULL,fetch_method TEXT,started_at TEXT NOT NULL,finished_at TEXT,rows_detected INTEGER DEFAULT 0,documents_detected INTEGER DEFAULT 0,new_entries INTEGER DEFAULT 0,updated_entries INTEGER DEFAULT 0,unchanged_entries INTEGER DEFAULT 0,duplicate_entries INTEGER DEFAULT 0,robots_status TEXT,captcha_status TEXT,error_code TEXT,error_message TEXT,snapshot_hash TEXT,metadata TEXT DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS raw_records(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_id TEXT REFERENCES data_sources(id),external_id TEXT,payload TEXT DEFAULT '{}',checksum TEXT,retrieved_at TEXT NOT NULL,stage TEXT NOT NULL DEFAULT 'RAW',source_url TEXT,raw_content TEXT,content_format TEXT,status TEXT NOT NULL DEFAULT 'RAW',metadata TEXT DEFAULT '{}',UNIQUE(organization_id,source_id,external_id,checksum));
+CREATE INDEX IF NOT EXISTS idx_raw_records_ext ON raw_records(organization_id,source_id,external_id);
+CREATE INDEX IF NOT EXISTS idx_raw_records_checksum ON raw_records(organization_id,checksum);
+CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_id TEXT REFERENCES data_sources(id),source_url TEXT NOT NULL,storage_key TEXT,storage_object_id TEXT REFERENCES storage_objects(id),document_type TEXT DEFAULT 'PDF',publication_date TEXT,downloaded_at TEXT,checksum TEXT,download_status TEXT DEFAULT 'NOT_DOWNLOADED',extraction_status TEXT DEFAULT 'NOT_STARTED',UNIQUE(organization_id,checksum));
+CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents(organization_id);
+CREATE TABLE IF NOT EXISTS dedup_candidates(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_a_id TEXT NOT NULL REFERENCES companies(id),company_b_id TEXT NOT NULL REFERENCES companies(id),match_basis TEXT NOT NULL,confidence REAL,status TEXT NOT NULL DEFAULT 'PENDING',metadata TEXT DEFAULT '{}',created_at TEXT NOT NULL,resolved_at TEXT,CHECK(company_a_id<>company_b_id));
+CREATE INDEX IF NOT EXISTS idx_dedup_tenant ON dedup_candidates(organization_id,status);
+CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_id TEXT REFERENCES data_sources(id),import_type TEXT NOT NULL,status TEXT NOT NULL,records_received INTEGER NOT NULL DEFAULT 0,records_valid INTEGER NOT NULL DEFAULT 0,records_created INTEGER NOT NULL DEFAULT 0,records_updated INTEGER NOT NULL DEFAULT 0,records_skipped INTEGER NOT NULL DEFAULT 0,records_failed INTEGER NOT NULL DEFAULT 0,error_summary TEXT,metadata TEXT DEFAULT '{}',started_at TEXT NOT NULL,finished_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_imports_tenant ON imports(organization_id,started_at);
 """
 
 DEMO_COMPANIES = [
@@ -123,6 +132,16 @@ def init_db():
         for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT'}.items():
             if name not in people_existing:db.execute(f'ALTER TABLE people ADD COLUMN {name} {kind}')
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_people_company_name ON people(organization_id,company_id,name_normalized) WHERE name_normalized IS NOT NULL")
+        # ÉTAPE 3 data-import core: additive columns mirrored from migration 0016.
+        company_existing={r['name'] for r in db.execute("PRAGMA table_info(companies)")}
+        for name,kind in {'source_id':'TEXT','retrieved_at':'TEXT','provenance':'TEXT','checksum':'TEXT'}.items():
+            if name not in company_existing:db.execute(f'ALTER TABLE companies ADD COLUMN {name} {kind}')
+        sources_existing={r['name'] for r in db.execute("PRAGMA table_info(data_sources)")}
+        for name,kind in {'provider':'TEXT','source_version':'TEXT','source_checksum':'TEXT','configuration':"TEXT DEFAULT '{}'",'retrieved_at':'TEXT','created_at':'TEXT','updated_at':'TEXT'}.items():
+            if name not in sources_existing:db.execute(f'ALTER TABLE data_sources ADD COLUMN {name} {kind}')
+        lineage_existing={r['name'] for r in db.execute("PRAGMA table_info(data_lineage)")}
+        for name,kind in {'raw_record_id':'TEXT','checksum':'TEXT','transformation':'TEXT'}.items():
+            if name not in lineage_existing:db.execute(f'ALTER TABLE data_lineage ADD COLUMN {name} {kind}')
         ts=now(); db.execute("INSERT OR IGNORE INTO organizations VALUES(?,?,?,?)",(ORG_ID,"NACELUX Demo Workspace","nacelux-demo",ts))
         db.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)",("user_demo_owner","demo@nacelux.local","Demo Owner",ts))
         db.execute("INSERT OR IGNORE INTO organization_members VALUES(?,?,?)",(ORG_ID,"user_demo_owner","OWNER"))
@@ -180,7 +199,7 @@ def recalculate_all(db, org_id):
         db.execute("""INSERT INTO opportunity_scores(id,organization_id,company_id,score,level,breakdown,recommended_action,calculated_at)
         VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(breakdown_data),result["action"],now()))
 
-def list_companies(org_id, q):
+def _companies_where(org_id, q):
     where=["c.organization_id=?"]; params=[org_id]
     mapping={"municipality":"c.municipality","canton":"c.canton","nace":"c.primary_nace_code","category":"c.category","niche":"c.niche","website":"c.website_status","level":"o.level"}
     if q.get("search"):
@@ -194,13 +213,21 @@ def list_companies(org_id, q):
             where.append("c.creation_date >= CURRENT_DATE - (? * INTERVAL '1 day')"); params.append(int(q["days"]))
         else:
             where.append("date(c.creation_date)>=date('now', ?)"); params.append(f"-{int(q['days'])} days")
-    sql=f"""SELECT c.*,o.score AS opportunity_score,o.level AS opportunity_level,o.recommended_action
-    FROM companies c JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id
-    WHERE {' AND '.join(where)} ORDER BY o.score DESC,c.company_name LIMIT 500"""
-    return rows(sql,params)
+    return ' AND '.join(where), params
+
+def list_companies(org_id, q, limit=500, offset=0):
+    # LEFT JOIN: companies imported before scoring exists still appear (score NULL).
+    clause,params=_companies_where(org_id,q)
+    return rows(f"""SELECT c.*,o.score AS opportunity_score,o.level AS opportunity_level,o.recommended_action
+    FROM companies c LEFT JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id
+    WHERE {clause} ORDER BY COALESCE(o.score,-1) DESC,c.company_name LIMIT ? OFFSET ?""",params+[limit,offset])
+
+def count_companies(org_id, q):
+    clause,params=_companies_where(org_id,q)
+    return one(f"SELECT count(*) count FROM companies c LEFT JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE {clause}",params)['count']
 
 def company_detail(org_id,cid):
-    c=one("""SELECT c.*,o.score opportunity_score,o.level opportunity_level,o.breakdown,o.recommended_action,o.calculated_at FROM companies c JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE c.organization_id=? AND c.id=?""",(org_id,cid))
+    c=one("""SELECT c.*,o.score opportunity_score,o.level opportunity_level,o.breakdown,o.recommended_action,o.calculated_at FROM companies c LEFT JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE c.organization_id=? AND c.id=?""",(org_id,cid))
     if c:
         raw_breakdown=c.get("breakdown") or []
         parsed=json.loads(raw_breakdown) if isinstance(raw_breakdown,str) else raw_breakdown

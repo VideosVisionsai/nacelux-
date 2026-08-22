@@ -55,7 +55,7 @@ def _run(cmd, **kw):
         ) from exc
 
 
-def bootstrap(*, pgdata: Path | str | None = None, dbname: str = "nacelux_test"):
+def bootstrap(*, pgdata: Path | str | None = None, dbname: str = "nacelux_test", set_app_database_url: bool = False):
     """Start an embedded PostgreSQL, create the non-owner roles + database, and
     apply every migration as the migration (superuser) role.
 
@@ -93,6 +93,13 @@ def bootstrap(*, pgdata: Path | str | None = None, dbname: str = "nacelux_test")
 
     super_uri = f"postgresql://postgres@127.0.0.1:{port}/{dbname}"
     pg_uri = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    runtime_uri = f"postgresql://nacelux_runtime@127.0.0.1:{port}/{dbname}"
+    worker_uri = f"postgresql://nacelux_worker@127.0.0.1:{port}/{dbname}"
+    if set_app_database_url:
+        # Must be set BEFORE db_adapter is first imported (during migrations
+        # import below) so IS_POSTGRES resolves to True for the app adapter.
+        os.environ["DATABASE_URL"] = runtime_uri
+        os.environ["DB_PROVIDER"] = "postgresql"
 
     # Wait until reachable.
     import psycopg  # noqa: WPS433 (lazy import; only needed when bootstrapping)
@@ -129,9 +136,6 @@ def bootstrap(*, pgdata: Path | str | None = None, dbname: str = "nacelux_test")
     os.environ.pop("NACELUX_ENV", None)  # dev mode: migrations do not hard-require SSL on the URL
     from migrations import run_migrations  # type: ignore
     applied = run_migrations()
-
-    runtime_uri = f"postgresql://nacelux_runtime@127.0.0.1:{port}/{dbname}"
-    worker_uri = f"postgresql://nacelux_worker@127.0.0.1:{port}/{dbname}"
 
     def stop():
         try:
