@@ -10,7 +10,8 @@ DEFAULT_WEIGHTS = {
     "decision_maker": 5,
     "commercial_potential": 10,
 }
-MODEL_VERSION = "nacelux-scoring-2.1"
+MODEL_VERSION = "nacelux-scoring-7.0"
+LEVELS = {"LOW": (0, 50), "MEDIUM": (50, 75), "HIGH": (75, 90), "VERY_HIGH": (90, 101)}
 
 
 def _age_days(value):
@@ -20,79 +21,87 @@ def _age_days(value):
         return 9999
 
 
-def calculate(company, weights=None):
-    """Deterministic score. Unknown data earns no points; it is never guessed.
-    Includes full input snapshot and cryptographic provenance fingerprint for exact reproducibility.
-    """
+def _level_for(score):
+    for name, (lo, hi) in LEVELS.items():
+        if lo <= score < hi:
+            return name.replace("_", " ")
+    return "LOW"
+
+
+def calculate(company, weights=None, signals=None):
+    """Deterministic, evidence-backed score. Unknown data earns 0 points.
+    When business signals are available (Step 6), they take priority over raw
+    company fields because they are evidence-backed.
+    Includes full input snapshot + SHA-256 fingerprint for exact reproducibility."""
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
+    sig = set(signals or [])
     factors = []
 
+    # --- Freshness (20) ---
     age = _age_days(company.get("creation_date"))
-    freshness_ratio = 1 if age <= 30 else .65 if age <= 90 else .3 if age <= 365 else 0
-    factors.append(("freshness", "Recent company" if age <= 90 else "Company freshness", round(w["freshness"] * freshness_ratio)))
+    if "NEW_COMPANY" in sig or "RECENT_INCORPORATION" in sig:
+        fr_ratio, fr_label = 1.0, "New company (signal-backed)"
+    elif age <= 30: fr_ratio, fr_label = 1.0, "Very recent"
+    elif age <= 90: fr_ratio, fr_label = .65, "Recent"
+    elif age <= 365: fr_ratio, fr_label = .3, "Within first year"
+    else: fr_ratio, fr_label = 0, "Established"
+    factors.append({"key":"freshness","label":fr_label,"ratio":fr_ratio,"points":round(w["freshness"]*fr_ratio),"max":w["freshness"]})
 
-    niche_ratio = float(company.get("niche_attractiveness") or 0) / 100
-    factors.append(("niche", "Niche attractiveness", round(w["niche"] * niche_ratio)))
-
-    website_status = company.get("website_status")
-    digital_score = company.get("digital_score")
-    # Missing measurement is unknown, not automatically a digital gap.
-    digital_ratio = 1 if website_status == "NOT_FOUND" else .65 if digital_score is not None and digital_score < 40 else .2 if digital_score is not None and digital_score < 70 else 0
-    factors.append(("digital_gap", "No website" if website_status == "NOT_FOUND" else "Digital gap", round(w["digital_gap"] * digital_ratio)))
-
-    seo = company.get("seo_opportunity")
-    seo_ratio = float(seo or 0) / 100
-    factors.append(("seo_opportunity", "SEO opportunity" if seo is not None else "SEO not assessed", round(w["seo_opportunity"] * seo_ratio)))
-
-    gb = company.get("google_status")
-    local_ratio = 1 if gb == "NOT_FOUND" else 0
-    factors.append(("local_presence", "No Google Business profile" if gb == "NOT_FOUND" else "Local presence", round(w["local_presence"] * local_ratio)))
-
-    people = company.get("decision_maker_status")
-    people_ratio = 1 if people == "FOUND" else 0
-    factors.append(("decision_maker", "Decision maker found" if people == "FOUND" else "Decision maker not confirmed", round(w["decision_maker"] * people_ratio)))
-
-    potential_ratio = float(company.get("commercial_potential") or 0) / 100
-    factors.append(("commercial_potential", "Commercial potential", round(w["commercial_potential"] * potential_ratio)))
-
-    score = min(100, sum(points for _, _, points in factors))
-    level = "VERY HIGH" if score >= 90 else "HIGH" if score >= 75 else "MEDIUM" if score >= 50 else "LOW"
-
-    if website_status == "NOT_FOUND":
-        action = "CREATE WEBSITE"
-        if seo_ratio >= .6: action += " + SEO"
-    elif gb == "NOT_FOUND" and seo_ratio >= .55:
-        action = "LOCAL SEO"
-    elif seo_ratio >= .65:
-        action = "SEO SERVICE"
-    elif digital_score is not None and digital_score < 45:
-        action = "WEBSITE REDESIGN"
-    elif score < 50:
-        action = "LOW PRIORITY"
+    # --- Niche attractiveness (20) ---
+    if "HIGH_VALUE_NICHE" in sig: n_ratio, n_label = 1.0, "High-value niche (signal-backed)"
     else:
-        action = "MONITOR"
+        n_ratio = float(company.get("niche_attractiveness") or 0) / 100; n_label = "Niche attractiveness"
+    factors.append({"key":"niche","label":n_label,"ratio":n_ratio,"points":round(w["niche"]*n_ratio),"max":w["niche"]})
 
-    # Input snapshot and cryptographic fingerprint for reproducibility
-    input_snapshot = {
-        "creation_date": company.get("creation_date"),
-        "website_status": company.get("website_status"),
-        "digital_score": company.get("digital_score"),
-        "seo_opportunity": company.get("seo_opportunity"),
-        "google_status": company.get("google_status"),
-        "decision_maker_status": company.get("decision_maker_status"),
-        "niche_attractiveness": company.get("niche_attractiveness"),
-        "commercial_potential": company.get("commercial_potential"),
-        "weights": w,
-        "model_version": MODEL_VERSION
-    }
+    # --- Digital gap (20) ---
+    if "NO_WEBSITE" in sig: d_ratio, d_label = 1.0, "No website (signal-backed)"
+    elif "WEAK_WEBSITE" in sig: d_ratio, d_label = .65, "Weak website (signal-backed)"
+    else:
+        ws = company.get("website_status"); ds = company.get("digital_score")
+        if ws == "NOT_FOUND": d_ratio, d_label = 1.0, "No website"
+        elif ds is not None and ds < 40: d_ratio, d_label = .65, "Low digital score"
+        elif ds is not None and ds < 70: d_ratio, d_label = .2, "Moderate digital"
+        else: d_ratio, d_label = 0, "Digital presence"
+    factors.append({"key":"digital_gap","label":d_label,"ratio":d_ratio,"points":round(w["digital_gap"]*d_ratio),"max":w["digital_gap"]})
+
+    # --- SEO opportunity (15) ---
+    if "WEAK_SEO" in sig:
+        s_val = company.get("seo_opportunity"); s_ratio = float(s_val)/100 if isinstance(s_val,(int,float)) else .6; s_label = "Weak SEO (signal-backed)"
+    else:
+        s_val = company.get("seo_opportunity"); s_ratio = float(s_val or 0)/100 if s_val is not None else 0; s_label = "SEO opportunity"
+    factors.append({"key":"seo_opportunity","label":s_label,"ratio":s_ratio,"points":round(w["seo_opportunity"]*s_ratio),"max":w["seo_opportunity"]})
+
+    # --- Local presence (10) ---
+    l_ratio = 1.0 if ("NO_GOOGLE_BUSINESS" in sig or company.get("google_status")=="NOT_FOUND") else 0
+    factors.append({"key":"local_presence","label":"No Google Business" if l_ratio else "Local presence","ratio":l_ratio,"points":round(w["local_presence"]*l_ratio),"max":w["local_presence"]})
+
+    # --- Decision maker (5) ---
+    p_ratio = 1.0 if ("DECISION_MAKER_FOUND" in sig or company.get("decision_maker_status")=="FOUND") else 0
+    factors.append({"key":"decision_maker","label":"Decision maker found" if p_ratio else "No confirmed decision maker","ratio":p_ratio,"points":round(w["decision_maker"]*p_ratio),"max":w["decision_maker"]})
+
+    # --- Commercial potential (10) ---
+    pot_ratio = float(company.get("commercial_potential") or 0)/100
+    factors.append({"key":"commercial_potential","label":"Commercial potential","ratio":pot_ratio,"points":round(w["commercial_potential"]*pot_ratio),"max":w["commercial_potential"]})
+
+    score = min(100, sum(f["points"] for f in factors))
+    level = _level_for(score)
+
+    # --- Recommended actions (deterministic, signal-driven) ---
+    actions = []
+    if "NO_WEBSITE" in sig or company.get("website_status")=="NOT_FOUND": actions.append("CREATE_WEBSITE")
+    if "WEAK_WEBSITE" in sig: actions.append("WEBSITE_REDESIGN")
+    if "WEAK_SEO" in sig: actions.append("SEO_SERVICE")
+    if "NO_GOOGLE_BUSINESS" in sig: actions.append("LOCAL_SEO")
+    if not actions and score < 50: actions.append("LOW_PRIORITY")
+    if not actions: actions.append("MONITOR")
+    action = " + ".join(actions)
+
+    input_snapshot = {"creation_date":company.get("creation_date"),"website_status":company.get("website_status"),
+        "digital_score":company.get("digital_score"),"seo_opportunity":company.get("seo_opportunity"),
+        "google_status":company.get("google_status"),"decision_maker_status":company.get("decision_maker_status"),
+        "niche_attractiveness":company.get("niche_attractiveness"),"commercial_potential":company.get("commercial_potential"),
+        "signals":sorted(sig),"weights":w,"model_version":MODEL_VERSION}
     fingerprint = hashlib.sha256(json.dumps(input_snapshot, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
-    return {
-        "score": score,
-        "level": level,
-        "action": action,
-        "model_version": MODEL_VERSION,
-        "provenance_fingerprint": fingerprint,
-        "input_snapshot": input_snapshot,
-        "factors": [{"key": key, "label": label, "points": points, "max": w[key]} for key, label, points in factors]
-    }
+    return {"score":score,"level":level,"action":action,"model_version":MODEL_VERSION,
+            "provenance_fingerprint":fingerprint,"input_snapshot":input_snapshot,"factors":factors}

@@ -28,7 +28,7 @@ CREATE INDEX IF NOT EXISTS idx_company_created ON companies(organization_id,crea
 CREATE TABLE IF NOT EXISTS business_signals(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,signal_type TEXT,signal_value TEXT,confidence REAL,source TEXT,detected_at TEXT,status TEXT DEFAULT 'ACTIVE',first_detected_at TEXT,last_seen_at TEXT,evidence TEXT DEFAULT '{}',severity TEXT,rule_version TEXT,explanation TEXT,expires_at TEXT,data_quality TEXT DEFAULT 'UNKNOWN',UNIQUE(organization_id,company_id,signal_type));
 CREATE TABLE IF NOT EXISTS business_signal_runs(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT,status TEXT NOT NULL,rule_version TEXT NOT NULL,started_at TEXT NOT NULL,completed_at TEXT,companies_processed INTEGER DEFAULT 0,active_signals INTEGER DEFAULT 0,activated INTEGER DEFAULT 0,deactivated INTEGER DEFAULT 0,error_code TEXT,error_message TEXT,metadata TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS business_signal_definitions(signal_type TEXT PRIMARY KEY,label TEXT NOT NULL,description TEXT NOT NULL,severity TEXT NOT NULL,required_evidence TEXT NOT NULL,is_active INTEGER DEFAULT 1,rule_version TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS opportunity_scores(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,score INTEGER,level TEXT,breakdown TEXT,recommended_action TEXT,calculated_at TEXT);
+CREATE TABLE IF NOT EXISTS opportunity_scores(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,score INTEGER,level TEXT,breakdown TEXT,recommended_action TEXT,calculated_at TEXT,model_version TEXT,factor_snapshot TEXT,input_snapshot TEXT,fingerprint TEXT);
 CREATE INDEX IF NOT EXISTS idx_opp_score ON opportunity_scores(organization_id,score DESC);
 CREATE TABLE IF NOT EXISTS prospects(id TEXT PRIMARY KEY,organization_id TEXT,company_id TEXT,status TEXT,priority TEXT,owner TEXT,assigned_to TEXT,notes TEXT,next_action TEXT,next_action_date TEXT,last_contacted_at TEXT,created_at TEXT,updated_at TEXT,UNIQUE(organization_id,company_id));
 CREATE TABLE IF NOT EXISTS data_sources(id TEXT PRIMARY KEY,organization_id TEXT,name TEXT,source_type TEXT,base_url TEXT,status TEXT,last_run_at TEXT,records_count INTEGER DEFAULT 0,note TEXT);
@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS digital_check_history(id TEXT PRIMARY KEY,organizatio
 CREATE INDEX IF NOT EXISTS idx_dch_tenant ON digital_check_history(organization_id,company_id,channel,checked_at);
 CREATE TABLE IF NOT EXISTS ai_extractions(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_document_id TEXT,source_extraction_id TEXT,source_page_id TEXT,person_id TEXT,provider TEXT,model TEXT,model_version TEXT,prompt_version TEXT,input_hash TEXT,output_hash TEXT,raw_content TEXT DEFAULT '{}',normalized TEXT DEFAULT '{}',evidence_quote TEXT,confidence REAL,needs_human_review INTEGER DEFAULT 0,status TEXT NOT NULL DEFAULT 'PENDING',rejection_reason TEXT,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_ai_tenant ON ai_extractions(organization_id,created_at);
+CREATE TABLE IF NOT EXISTS opportunity_score_history(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),model_version TEXT NOT NULL,total_score INTEGER NOT NULL,level TEXT NOT NULL,recommended_action TEXT,factor_snapshot TEXT DEFAULT '{}',input_snapshot TEXT DEFAULT '{}',fingerprint TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_osh_tenant ON opportunity_score_history(organization_id,company_id,created_at);
 """
 
 DEMO_COMPANIES = [
@@ -146,6 +148,9 @@ def init_db():
         lineage_existing={r['name'] for r in db.execute("PRAGMA table_info(data_lineage)")}
         for name,kind in {'raw_record_id':'TEXT','checksum':'TEXT','transformation':'TEXT'}.items():
             if name not in lineage_existing:db.execute(f'ALTER TABLE data_lineage ADD COLUMN {name} {kind}')
+        opp_existing={r['name'] for r in db.execute("PRAGMA table_info(opportunity_scores)")}
+        for name,kind in {'model_version':'TEXT','factor_snapshot':'TEXT','input_snapshot':'TEXT','fingerprint':'TEXT'}.items():
+            if name not in opp_existing:db.execute(f'ALTER TABLE opportunity_scores ADD COLUMN {name} {kind}')
         ts=now(); db.execute("INSERT OR IGNORE INTO organizations VALUES(?,?,?,?)",(ORG_ID,"NACELUX Demo Workspace","nacelux-demo",ts))
         db.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)",("user_demo_owner","demo@nacelux.local","Demo Owner",ts))
         db.execute("INSERT OR IGNORE INTO organization_members VALUES(?,?,?)",(ORG_ID,"user_demo_owner","OWNER"))
@@ -193,15 +198,12 @@ def recalculate_all(db, org_id):
     try: weights={r['factor']:r['weight'] for r in db.execute("SELECT factor,weight FROM scoring_weights WHERE organization_id=?",(org_id,))}
     except sqlite3.OperationalError: weights={}
     for c in companies:
-        result=calculate(c,weights); oid="opp_"+c["id"]
-        breakdown_data={
-            "factors": result["factors"],
-            "model_version": result["model_version"],
-            "provenance_fingerprint": result["provenance_fingerprint"],
-            "input_snapshot": result["input_snapshot"]
-        }
-        db.execute("""INSERT INTO opportunity_scores(id,organization_id,company_id,score,level,breakdown,recommended_action,calculated_at)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(breakdown_data),result["action"],now()))
+        sig_types=[r['signal_type'] for r in db.execute("SELECT signal_type FROM business_signals WHERE organization_id=? AND company_id=? AND status='ACTIVE'",(org_id,c["id"])).fetchall()]
+        result=calculate(c,weights,signals=sig_types); oid="opp_"+c["id"]
+        breakdown_data={"factors":result["factors"],"model_version":result["model_version"],"provenance_fingerprint":result["provenance_fingerprint"],"input_snapshot":result["input_snapshot"]}
+        db.execute("""INSERT INTO opportunity_scores(id,organization_id,company_id,score,level,breakdown,recommended_action,calculated_at,model_version,factor_snapshot,input_snapshot,fingerprint)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET score=excluded.score,level=excluded.level,breakdown=excluded.breakdown,recommended_action=excluded.recommended_action,calculated_at=excluded.calculated_at,model_version=excluded.model_version,factor_snapshot=excluded.factor_snapshot,input_snapshot=excluded.input_snapshot,fingerprint=excluded.fingerprint""",(oid,org_id,c["id"],result["score"],result["level"],json.dumps(breakdown_data),result["action"],now(),result["model_version"],json.dumps(result["factors"]),json.dumps(result["input_snapshot"]),result["provenance_fingerprint"]))
+        db.execute("INSERT INTO opportunity_score_history(id,organization_id,company_id,model_version,total_score,level,recommended_action,factor_snapshot,input_snapshot,fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",("osh_"+str(uuid.uuid4())[:24],org_id,c["id"],result["model_version"],result["score"],result["level"],result["action"],json.dumps(result["factors"]),json.dumps(result["input_snapshot"]),result["provenance_fingerprint"],now()))
 
 def _companies_where(org_id, q):
     where=["c.organization_id=?"]; params=[org_id]
