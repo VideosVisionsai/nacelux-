@@ -13,9 +13,9 @@ class SignalGuardrailTests(unittest.TestCase):
  def test_company_status_without_completed_check_creates_no_negative_signal(self):
   result=BusinessSignalEngine(self.connect).refresh('o','c');types={x['signal_type'] for x in result['signals']};self.assertNotIn('NO_WEBSITE',types);self.assertNotIn('NO_GOOGLE_BUSINESS',types)
  def test_signal_is_deactivated_when_evidence_changes(self):
-  with self.connect() as db:db.execute("INSERT INTO digital_checks(id,organization_id,company_id,channel,status,confidence,checked_at,details) VALUES(?,?,?,?,?,?,?,?)",('d','o','c','Website','NOT_FOUND',1,'2026-01-01','{}'))
+  with self.connect() as db:db.execute("INSERT INTO digital_checks(id,organization_id,company_id,channel,status,confidence,checked_at,details) VALUES(?,?,?,?,?,?,?,?)",('d','o','c','Website','NOT_FOUND',1,'2026-01-01','{}'));db.execute("INSERT INTO website_discovery_runs(id,organization_id,company_id,status,provider,query_text,started_at,candidates_found,selected_candidate_id) VALUES(?,?,?,?,?,?,?, ?,?)",('run','o','c','SUCCESS','test','q','2026-01-01',0,None))
   engine=BusinessSignalEngine(self.connect);self.assertIn('NO_WEBSITE',{x['signal_type'] for x in engine.refresh('o','c')['signals']})
-  with self.connect() as db:db.execute("UPDATE digital_checks SET status='FOUND' WHERE id='d'")
+  with self.connect() as db:db.execute("UPDATE website_discovery_runs SET selected_candidate_id='found_x' WHERE id='run'")
   result=engine.refresh('o','c');self.assertEqual(result['deactivated'],1)
   with self.connect() as db:self.assertEqual(db.execute("SELECT status FROM business_signals WHERE signal_type='NO_WEBSITE'").fetchone()[0],'INACTIVE')
 if __name__=='__main__':unittest.main()

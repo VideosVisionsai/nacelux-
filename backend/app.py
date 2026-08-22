@@ -405,7 +405,9 @@ class API(BaseHTTPRequestHandler):
     def dashboard(self):
         items=data.list_companies(self.org,{})
         def n(pred): return sum(1 for x in items if pred(x))
-        today={"new_companies":n(lambda x:(x.get("creation_date") or "") >= __import__('datetime').date.today().isoformat()),"new_opportunities":n(lambda x:(x.get("opportunity_score") or 0)>=75),"high_priority":n(lambda x:(x.get("opportunity_score") or 0)>=90),"without_website":n(lambda x:x["website_status"]=="NOT_FOUND"),"weak_seo":n(lambda x:x.get("seo_score") is not None and x["seo_score"]<50),"without_google":n(lambda x:x["google_status"]=="NOT_FOUND"),"decision_makers":n(lambda x:x["decision_maker_status"]=="FOUND")}
+        sig_active=data.one("SELECT count(*) count FROM business_signals WHERE organization_id=? AND status='ACTIVE'",(self.org,))['count']
+        sig_high=data.one("SELECT count(*) count FROM business_signals WHERE organization_id=? AND status='ACTIVE' AND severity IN ('HIGH','POSITIVE')",(self.org,))['count']
+        today={"new_companies":n(lambda x:(x.get("creation_date") or "") >= __import__('datetime').date.today().isoformat()),"new_opportunities":n(lambda x:(x.get("opportunity_score") or 0)>=75),"high_priority":n(lambda x:(x.get("opportunity_score") or 0)>=90),"without_website":n(lambda x:x["website_status"]=="NOT_FOUND"),"weak_seo":n(lambda x:x.get("seo_score") is not None and x["seo_score"]<50),"without_google":n(lambda x:x["google_status"]=="NOT_FOUND"),"decision_makers":n(lambda x:x["decision_maker_status"]=="FOUND"),"active_signals":sig_active,"high_priority_signals":sig_high}
         def group(field):
             out={}
             for x in items: out[x.get(field) or "Unknown"]=out.get(x.get(field) or "Unknown",0)+1
