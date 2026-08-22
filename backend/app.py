@@ -18,6 +18,7 @@ from seo_engine import SEOAuditEngine, BusinessSignalEngine
 from people_engine import PeopleEngine
 import import_pipeline as pipeline
 import resa_pipeline as resapipe
+import outreach as outreach_engine
 
 PEOPLE_ENGINE=PeopleEngine(data.connect)
 SEO_AUDIT=SEOAuditEngine(data.connect)
@@ -162,6 +163,10 @@ class API(BaseHTTPRequestHandler):
                 # validation status
                 validation=data.one("SELECT validation_status,validated_by,validated_at,validation_comment FROM companies WHERE organization_id=? AND id=?",(self.org,cid))
                 return self.json({"company":detail,"accepted_signals":accepted,"rejected_signals":rejected,"score_history":history,"validation":{"status":(validation["validation_status"] if validation else "REVIEW_PENDING"),"reviewer":(validation["validated_by"] if validation else None),"reviewed_at":(validation["validated_at"] if validation else None),"comment":(validation["validation_comment"] if validation else None)}})
+            if path.startswith("/api/v1/opportunities/") and path.endswith("/outreach"):
+                cid=path.split("/")[-2]
+                result=outreach_engine.prepare_outreach(self.org,cid)
+                return self.json(result,200 if result.get("status")=="SUCCESS" else 422)
             if path=="/api/v1/prospects": return self.json({"items":data.rows("""SELECT p.*,c.company_name,c.municipality,o.score FROM prospects p JOIN companies c ON c.id=p.company_id AND c.organization_id=p.organization_id JOIN opportunity_scores o ON o.company_id=c.id AND o.organization_id=c.organization_id WHERE p.organization_id=? ORDER BY p.updated_at DESC""",(self.org,))})
             if path=="/api/v1/sources": return self.json({"items":data.rows("SELECT * FROM data_sources WHERE organization_id=? ORDER BY name",(self.org,)),"jobs":data.rows("SELECT * FROM jobs WHERE organization_id=? ORDER BY started_at DESC LIMIT 20",(self.org,))})
             if path=="/api/v1/imports": return self.json({"items":data.rows("SELECT id,source_id,import_type,status,records_received,records_valid,records_created,records_updated,records_skipped,records_failed,started_at,finished_at FROM imports WHERE organization_id=? ORDER BY started_at DESC LIMIT 50",(self.org,))})
@@ -407,6 +412,37 @@ class API(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO opportunity_validations(id,organization_id,company_id,previous_status,new_status,reviewer,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",("ov_"+str(uuid.uuid4())[:24],self.org,company_id,prev,decision,ctx['user_id'],comment,ts))
             data.audit(self.org,'VALIDATE_OPPORTUNITY','company',company_id,{'previous':prev,'new':decision,'comment':comment})
             return self.json({'status':'SUCCESS','validation_status':decision,'previous_status':prev})
+        if path=="/api/v1/outreach/draft":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            result=outreach_engine.prepare_outreach(self.org,company_id)
+            if result.get('status')!='SUCCESS':return self.json(result,422)
+            draft=result['draft']
+            did='od_'+str(uuid.uuid4())[:24];ts=data.now()
+            with data.connect() as db:
+                db.execute("INSERT INTO outreach_drafts(id,organization_id,company_id,provider,model,prompt_version,input_hash,output_hash,subject,greeting,body,claims,evidence_references,confidence,review_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (did,self.org,company_id,draft.get('provider'),draft.get('model'),draft.get('prompt_version'),draft.get('input_hash'),draft.get('output_hash'),draft.get('subject'),draft.get('greeting'),draft.get('body'),json.dumps(draft.get('claims',[])),json.dumps(draft.get('evidence_references',[])),draft.get('confidence'),'DRAFT',ts))
+            data.audit(self.org,'OUTREACH_DRAFT','outreach_draft',did,{'company':company_id,'provider':draft.get('provider')})
+            result['draft_id']=did;return self.json(result,201)
+        if path=="/api/v1/outreach/review":
+            draft_id=str(body.get('draft_id','')).strip(); decision=str(body.get('decision','')).upper().strip(); comment=str(body.get('comment',''))[:2000]
+            if decision not in ('APPROVED','REJECTED','READY_TO_SEND','REVIEW_REQUIRED'):return self.json({'error':'decision must be APPROVED, REJECTED, READY_TO_SEND, or REVIEW_REQUIRED'},400)
+            draft=data.one("SELECT id,review_status FROM outreach_drafts WHERE organization_id=? AND id=?",(self.org,draft_id))
+            if not draft:return self.json({'error':'Draft not found'},404)
+            prev=draft['review_status'] or 'DRAFT'; ctx=self.auth_context; ts=data.now()
+            edited_subject=body.get('edited_subject'); edited_body=body.get('edited_body')
+            with data.connect() as db:
+                updates="review_status=?,reviewer=?,reviewed_at=?,review_comment=?"
+                params=[decision,ctx['user_id'],ts,comment]
+                if edited_subject is not None:updates+=",edited_subject=?";params.append(edited_subject)
+                if edited_body is not None:updates+=",edited_body=?";params.append(edited_body)
+                params += [self.org,draft_id]
+                db.execute(f"UPDATE outreach_drafts SET {updates} WHERE organization_id=? AND id=?",params)
+                db.execute("INSERT INTO outreach_reviews(id,organization_id,draft_id,previous_status,new_status,reviewer,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",("or_"+str(uuid.uuid4())[:24],self.org,draft_id,prev,decision,ctx['user_id'],comment,ts))
+            data.audit(self.org,'OUTREACH_REVIEW','outreach_draft',draft_id,{'previous':prev,'new':decision,'comment':comment})
+            return self.json({'status':'SUCCESS','review_status':decision,'previous_status':prev,'ready_to_send':decision=='READY_TO_SEND'})
         if path=="/api/v1/import":
             rows=body.get('rows',[])
             if not isinstance(rows,list) or len(rows)>1000:return self.json({"error":"Invalid import or limit exceeded"},400)

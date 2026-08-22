@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS opportunity_score_history(id TEXT PRIMARY KEY,organiz
 CREATE INDEX IF NOT EXISTS idx_osh_tenant ON opportunity_score_history(organization_id,company_id,created_at);
 CREATE TABLE IF NOT EXISTS opportunity_validations(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),previous_status TEXT NOT NULL,new_status TEXT NOT NULL,reviewer TEXT,comment TEXT,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_ov_tenant ON opportunity_validations(organization_id,company_id,created_at);
+CREATE TABLE IF NOT EXISTS outreach_drafts(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),provider TEXT NOT NULL,model TEXT,prompt_version TEXT,input_hash TEXT,output_hash TEXT,subject TEXT,greeting TEXT,body TEXT,claims TEXT DEFAULT '[]',evidence_references TEXT DEFAULT '[]',confidence REAL,review_status TEXT NOT NULL DEFAULT 'DRAFT',reviewer TEXT,reviewed_at TEXT,review_comment TEXT,edited_subject TEXT,edited_body TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_outreach_tenant ON outreach_drafts(organization_id,company_id,created_at);
+CREATE TABLE IF NOT EXISTS outreach_reviews(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),draft_id TEXT NOT NULL REFERENCES outreach_drafts(id),previous_status TEXT NOT NULL,new_status TEXT NOT NULL,reviewer TEXT,comment TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_or_tenant ON outreach_reviews(organization_id,draft_id,created_at);
 """
 
 DEMO_COMPANIES = [
