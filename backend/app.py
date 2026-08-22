@@ -215,6 +215,23 @@ class API(BaseHTTPRequestHandler):
             company_id=path.split('/')[-2];result=DIGITAL_FOOTPRINT.analyze(self.org,company_id)
             with data.connect() as db:data.recalculate_all(db,self.org)
             data.audit(self.org,'DIGITAL_FOOTPRINT_CHECK','company',company_id,{'status':result.get('status'),'digital_score':result.get('digital_score')});return self.json(result,200 if result.get('status')=='SUCCESS' else 422)
+        if path=="/api/v1/digital/check":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            url=str(body.get('url','')).strip() or None
+            result=WEBSITE_DISCOVERY.verify_website(self.org,company_id,url)
+            data.audit(self.org,'WEBSITE_VERIFY','company',company_id,{'status':result.get('status'),'url':result.get('url')})
+            return self.json(result,200 if result.get('status') in ('CONNECTED','NOT_CHECKED') else 422)
+        if path=="/api/v1/websites/discover":
+            company_id=str(body.get('company_id','')).strip()
+            if not company_id:return self.json({'error':'company_id is required'},400)
+            company=data.one("SELECT id FROM companies WHERE organization_id=? AND id=?",(self.org,company_id))
+            if not company:return self.json({'error':'Company not found'},404)
+            result=WEBSITE_DISCOVERY.discover(self.org,company_id)
+            data.audit(self.org,'WEBSITE_DISCOVERY','company',company_id,{'status':result.get('status')})
+            return self.json(result,200 if result.get('status') in ('FOUND','NOT_FOUND','NOT_CONFIGURED') else 422)
         if path=="/api/v1/nace/import":
             result=NACE_IMPORTER.import_official();data.audit(self.org,'IMPORT_OFFICIAL_NACE','nace_version','2.1',result)
             return self.json(result,200 if result.get('status')=='SUCCESS' else 422)

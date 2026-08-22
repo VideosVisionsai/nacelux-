@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS people_engine_runs(id TEXT PRIMARY KEY,organization_i
 CREATE TABLE IF NOT EXISTS people_evidence(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,person_id TEXT NOT NULL,evidence_type TEXT NOT NULL,source_url TEXT NOT NULL,source_document_id TEXT,source_extraction_id TEXT,excerpt TEXT,confidence REAL NOT NULL,method TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(person_id,evidence_type,source_url));
 CREATE TABLE IF NOT EXISTS professional_profiles_public(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,person_id TEXT NOT NULL,company_id TEXT NOT NULL,platform TEXT NOT NULL,profile_url TEXT NOT NULL,public_title TEXT,match_status TEXT NOT NULL,match_confidence REAL NOT NULL,evidence TEXT DEFAULT '{}',source_provider TEXT NOT NULL,checked_at TEXT NOT NULL,UNIQUE(organization_id,platform,profile_url));
 CREATE TABLE IF NOT EXISTS privacy_requests(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,person_id TEXT,request_type TEXT NOT NULL,status TEXT NOT NULL,requester_reference TEXT,notes TEXT,created_at TEXT NOT NULL,resolved_at TEXT);
-CREATE TABLE IF NOT EXISTS digital_checks(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT NOT NULL,channel TEXT,status TEXT,source_url TEXT,confidence REAL,checked_at TEXT,details TEXT,source_provider TEXT,evidence TEXT DEFAULT '{}',error_code TEXT,check_method TEXT,UNIQUE(organization_id,company_id,channel));
+CREATE TABLE IF NOT EXISTS digital_checks(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT NOT NULL,channel TEXT,status TEXT,source_url TEXT,confidence REAL,checked_at TEXT,details TEXT,source_provider TEXT,evidence TEXT DEFAULT '{}',error_code TEXT,check_method TEXT,http_status INTEGER,response_ms INTEGER,page_bytes INTEGER,https_status TEXT,final_url TEXT,value TEXT,explanation TEXT,rule_version TEXT,UNIQUE(organization_id,company_id,channel));
 CREATE TABLE IF NOT EXISTS website_discovery_runs(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT NOT NULL,status TEXT NOT NULL,provider TEXT,query_text TEXT,started_at TEXT NOT NULL,completed_at TEXT,candidates_found INTEGER DEFAULT 0,selected_candidate_id TEXT,error_code TEXT,error_message TEXT,metadata TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS website_candidates(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT NOT NULL,run_id TEXT NOT NULL,url TEXT NOT NULL,canonical_url TEXT NOT NULL,domain TEXT NOT NULL,title TEXT,snippet TEXT,confidence REAL NOT NULL,match_status TEXT NOT NULL,evidence TEXT DEFAULT '{}',discovery_source TEXT NOT NULL,checked_at TEXT NOT NULL,UNIQUE(organization_id,company_id,canonical_url));
 CREATE TABLE IF NOT EXISTS google_business_profiles(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,company_id TEXT NOT NULL,place_id TEXT,business_name TEXT,formatted_address TEXT,primary_type TEXT,website_url TEXT,phone TEXT,rating REAL,review_count INTEGER,status TEXT NOT NULL,source_url TEXT,checked_at TEXT NOT NULL,raw_data TEXT DEFAULT '{}',UNIQUE(organization_id,company_id));
@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS dedup_candidates(id TEXT PRIMARY KEY,organization_id 
 CREATE INDEX IF NOT EXISTS idx_dedup_tenant ON dedup_candidates(organization_id,status);
 CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_id TEXT REFERENCES data_sources(id),import_type TEXT NOT NULL,status TEXT NOT NULL,records_received INTEGER NOT NULL DEFAULT 0,records_valid INTEGER NOT NULL DEFAULT 0,records_created INTEGER NOT NULL DEFAULT 0,records_updated INTEGER NOT NULL DEFAULT 0,records_skipped INTEGER NOT NULL DEFAULT 0,records_failed INTEGER NOT NULL DEFAULT 0,error_summary TEXT,metadata TEXT DEFAULT '{}',started_at TEXT NOT NULL,finished_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_imports_tenant ON imports(organization_id,started_at);
+CREATE TABLE IF NOT EXISTS digital_check_history(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),channel TEXT NOT NULL,status TEXT NOT NULL,source_url TEXT,http_status INTEGER,response_ms INTEGER,page_bytes INTEGER,https_status TEXT,final_url TEXT,checked_at TEXT NOT NULL,details TEXT DEFAULT '{}',rule_version TEXT);
+CREATE INDEX IF NOT EXISTS idx_dch_tenant ON digital_check_history(organization_id,company_id,channel,checked_at);
 """
 
 DEMO_COMPANIES = [
@@ -116,7 +118,7 @@ def init_db():
         for name,kind in {'storage_object_id':'TEXT','storage_provider':'TEXT','storage_bucket':'TEXT','storage_key':'TEXT','mime_type':'TEXT','size_bytes':'INTEGER','downloaded_at':'TEXT','http_status':'INTEGER','last_error':'TEXT'}.items():
             if name not in existing:db.execute(f'ALTER TABLE resa_documents ADD COLUMN {name} {kind}')
         digital_existing={r['name'] for r in db.execute("PRAGMA table_info(digital_checks)")}
-        for name,kind in {'source_provider':'TEXT','evidence':"TEXT DEFAULT '{}'",'error_code':'TEXT','check_method':'TEXT'}.items():
+        for name,kind in {'source_provider':'TEXT','evidence':"TEXT DEFAULT '{}'",'error_code':'TEXT','check_method':'TEXT','http_status':'INTEGER','response_ms':'INTEGER','page_bytes':'INTEGER','https_status':'TEXT','final_url':'TEXT','value':'TEXT','explanation':'TEXT','rule_version':'TEXT'}.items():
             if name not in digital_existing:db.execute(f'ALTER TABLE digital_checks ADD COLUMN {name} {kind}')
         seo_existing={r['name'] for r in db.execute("PRAGMA table_info(seo_audits)")}
         for name,kind in {'final_url':'TEXT','http_status':'INTEGER','https_status':'TEXT','title':'TEXT','title_length':'INTEGER','h1_count':'INTEGER','h1_text':'TEXT','meta_description':'TEXT','meta_length':'INTEGER','mobile_status':'TEXT','performance_score':'INTEGER','response_ms':'INTEGER','page_size_bytes':'INTEGER','canonical_url':'TEXT','robots_meta':'TEXT','audit_method':'TEXT','error_code':'TEXT','error_message':'TEXT'}.items():
@@ -244,6 +246,7 @@ def company_detail(org_id,cid):
         c["signals"]=rows("SELECT * FROM business_signals WHERE organization_id=? AND company_id=?",(org_id,cid))
         c["lineage"]=rows("SELECT * FROM data_lineage WHERE organization_id=? AND entity_id=?",(org_id,cid))
         c["prospect"]=one("SELECT * FROM prospects WHERE organization_id=? AND company_id=?",(org_id,cid))
+        c["digital"]=rows("SELECT channel,status,source_url,confidence,checked_at,http_status,response_ms,page_bytes,https_status,final_url,value,explanation,rule_version,details FROM digital_checks WHERE organization_id=? AND company_id=?",(org_id,cid))
     return c
 
 def audit(org_id,action,etype,eid,metadata=None,user_id=None):
