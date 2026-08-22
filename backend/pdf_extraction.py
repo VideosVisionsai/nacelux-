@@ -63,6 +63,51 @@ def run_ocrmypdf(in_path, out_path, *, languages='fra+deu+eng', timeout=180):
         raise RuntimeError(f'OCRmyPDF failed: {(proc.stderr or "").strip()[:500]}')
     return out_path
 
+def has_poppler():
+    """Poppler pdftotext availability (technical fallback when PyMuPDF fails)."""
+    return bool(shutil.which('pdftotext'))
+
+
+def native_pages_pdftotext(path, *, max_pages=None):
+    """Fallback: extract text per page using Poppler pdftotext. Raises if absent."""
+    if not has_poppler():
+        raise RuntimeError('pdftotext (Poppler) not installed (REQUIRES_CONFIGURATION)')
+    import subprocess
+    proc = subprocess.run(['pdftotext', '-layout', path, '-'], capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f'pdftotext failed: {proc.stderr.strip()[:200]}')
+    raw_pages = proc.stdout.split('\f')
+    pages = [{'page_number': i + 1, 'text': p.strip()} for i, p in enumerate(raw_pages) if p.strip()]
+    if max_pages is not None and len(pages) > max_pages:
+        raise RuntimeError(f'PDF has {len(pages)} pages; configured maximum is {max_pages}')
+    return pages
+
+
+def native_blocks_pymupdf(path, *, max_pages=None):
+    """Extract text blocks with bounding-box coordinates per page using PyMuPDF.
+    Returns [{page_number, blocks: [{x0, y0, x1, y1, text, block_no}]}]."""
+    import pymupdf
+    doc = pymupdf.open(path)
+    try:
+        if doc.is_encrypted:
+            raise RuntimeError('PDF is encrypted')
+        if max_pages is not None and doc.page_count > max_pages:
+            raise RuntimeError(f'PDF has {doc.page_count} pages; configured maximum is {max_pages}')
+        result = []
+        for i in range(doc.page_count):
+            page = doc[i]
+            raw_blocks = page.get_text('blocks')
+            blocks = []
+            for b in raw_blocks:
+                if len(b) >= 5 and (b[4] or '').strip():
+                    blocks.append({'block_no': len(blocks), 'x0': round(float(b[0]), 2), 'y0': round(float(b[1]), 2),
+                                   'x1': round(float(b[2]), 2), 'y1': round(float(b[3]), 2), 'text': b[4].strip()})
+            result.append({'page_number': i + 1, 'blocks': blocks})
+        return result
+    finally:
+        doc.close()
+
+
 def extract_people_from_pages(pages):
     """Extract ONLY explicitly labelled directors/roles from extracted page text.
     Returns [{display_name, official_role, page, excerpt}]. Reuses the RESA pipeline

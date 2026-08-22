@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,organization_id TEXT NOT 
 CREATE INDEX IF NOT EXISTS idx_imports_tenant ON imports(organization_id,started_at);
 CREATE TABLE IF NOT EXISTS digital_check_history(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),company_id TEXT NOT NULL REFERENCES companies(id),channel TEXT NOT NULL,status TEXT NOT NULL,source_url TEXT,http_status INTEGER,response_ms INTEGER,page_bytes INTEGER,https_status TEXT,final_url TEXT,checked_at TEXT NOT NULL,details TEXT DEFAULT '{}',rule_version TEXT);
 CREATE INDEX IF NOT EXISTS idx_dch_tenant ON digital_check_history(organization_id,company_id,channel,checked_at);
+CREATE TABLE IF NOT EXISTS ai_extractions(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),source_document_id TEXT,source_extraction_id TEXT,source_page_id TEXT,person_id TEXT,provider TEXT,model TEXT,model_version TEXT,prompt_version TEXT,input_hash TEXT,output_hash TEXT,raw_content TEXT DEFAULT '{}',normalized TEXT DEFAULT '{}',evidence_quote TEXT,confidence REAL,needs_human_review INTEGER DEFAULT 0,status TEXT NOT NULL DEFAULT 'PENDING',rejection_reason TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_ai_tenant ON ai_extractions(organization_id,created_at);
 """
 
 DEMO_COMPANIES = [
@@ -131,7 +133,7 @@ def init_db():
         for name,kind in {'payload':"TEXT DEFAULT '{}'",'attempt':'INTEGER DEFAULT 0','schedule':'TEXT'}.items():
             if name not in jobs_existing:db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         people_existing={r['name'] for r in db.execute("PRAGMA table_info(people)")}
-        for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT','review_status':'TEXT','reviewer':'TEXT','reviewed_at':'TEXT','review_comment':'TEXT','source_page':'INTEGER','evidence_excerpt':'TEXT'}.items():
+        for name,kind in {'name_normalized':'TEXT','official_role':'TEXT','source_url':'TEXT','source_document_id':'TEXT','source_extraction_id':'TEXT','checked_at':'TEXT','privacy_status':"TEXT DEFAULT 'ACTIVE'",'retention_until':'TEXT','review_status':'TEXT','reviewer':'TEXT','reviewed_at':'TEXT','review_comment':'TEXT','source_page':'INTEGER','evidence_excerpt':'TEXT','role_type':'TEXT','role_confirmed':'INTEGER DEFAULT 0','needs_human_review':'INTEGER DEFAULT 0','x0':'REAL','y0':'REAL','x1':'REAL','y1':'REAL','block_text':'TEXT'}.items():
             if name not in people_existing:db.execute(f'ALTER TABLE people ADD COLUMN {name} {kind}')
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_people_company_name ON people(organization_id,company_id,name_normalized) WHERE name_normalized IS NOT NULL")
         # ÉTAPE 3 data-import core: additive columns mirrored from migration 0016.
